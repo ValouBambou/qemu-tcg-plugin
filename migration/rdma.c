@@ -13,9 +13,9 @@
  * later.  See the COPYING file in the top-level directory.
  *
  */
+
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "qemu/cutils.h"
 #include "rdma.h"
 #include "migration.h"
@@ -24,6 +24,8 @@
 #include "qemu-file-channel.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/module.h"
+#include "qemu/rcu.h"
 #include "qemu/sockets.h"
 #include "qemu/bitmap.h"
 #include "qemu/coroutine.h"
@@ -624,9 +626,12 @@ static int rdma_add_block(RDMAContext *rdma, const char *block_name,
  * in advanced before the migration starts. This tells us where the RAM blocks
  * are so that we can register them individually.
  */
-static int qemu_rdma_init_one_block(const char *block_name, void *host_addr,
-    ram_addr_t block_offset, ram_addr_t length, void *opaque)
+static int qemu_rdma_init_one_block(RAMBlock *rb, void *opaque)
 {
+    const char *block_name = qemu_ram_get_idstr(rb);
+    void *host_addr = qemu_ram_get_host_addr(rb);
+    ram_addr_t block_offset = qemu_ram_get_offset(rb);
+    ram_addr_t length = qemu_ram_get_used_length(rb);
     return rdma_add_block(opaque, block_name, host_addr, block_offset, length);
 }
 
@@ -638,10 +643,14 @@ static int qemu_rdma_init_one_block(const char *block_name, void *host_addr,
 static int qemu_rdma_init_ram_blocks(RDMAContext *rdma)
 {
     RDMALocalBlocks *local = &rdma->local_ram_blocks;
+    int ret;
 
     assert(rdma->blockmap == NULL);
     memset(local, 0, sizeof *local);
-    qemu_ram_foreach_migratable_block(qemu_rdma_init_one_block, rdma);
+    ret = foreach_not_ignored_block(qemu_rdma_init_one_block, rdma);
+    if (ret) {
+        return ret;
+    }
     trace_qemu_rdma_init_ram_blocks(local->nb_blocks);
     rdma->dest_blocks = g_new0(RDMADestBlock,
                                rdma->local_ram_blocks.nb_blocks);
@@ -831,10 +840,9 @@ static void qemu_rdma_dump_gid(const char *who, struct rdma_cm_id *id)
  */
 static int qemu_rdma_broken_ipv6_kernel(struct ibv_context *verbs, Error **errp)
 {
-    struct ibv_port_attr port_attr;
-
     /* This bug only exists in linux, to our knowledge. */
 #ifdef CONFIG_LINUX
+    struct ibv_port_attr port_attr;
 
     /*
      * Verbs are only NULL if management has bound to '[::]'.
@@ -2321,6 +2329,9 @@ static void qemu_rdma_cleanup(RDMAContext *rdma)
         rdma->connected = false;
     }
 
+    if (rdma->channel) {
+        qemu_set_fd_handler(rdma->channel->fd, NULL, NULL, NULL);
+    }
     g_free(rdma->dest_blocks);
     rdma->dest_blocks = NULL;
 
@@ -3006,11 +3017,35 @@ static void qio_channel_rdma_set_aio_fd_handler(QIOChannel *ioc,
     }
 }
 
+struct rdma_close_rcu {
+    struct rcu_head rcu;
+    RDMAContext *rdmain;
+    RDMAContext *rdmaout;
+};
+
+/* callback from qio_channel_rdma_close via call_rcu */
+static void qio_channel_rdma_close_rcu(struct rdma_close_rcu *rcu)
+{
+    if (rcu->rdmain) {
+        qemu_rdma_cleanup(rcu->rdmain);
+    }
+
+    if (rcu->rdmaout) {
+        qemu_rdma_cleanup(rcu->rdmaout);
+    }
+
+    g_free(rcu->rdmain);
+    g_free(rcu->rdmaout);
+    g_free(rcu);
+}
+
 static int qio_channel_rdma_close(QIOChannel *ioc,
                                   Error **errp)
 {
     QIOChannelRDMA *rioc = QIO_CHANNEL_RDMA(ioc);
     RDMAContext *rdmain, *rdmaout;
+    struct rdma_close_rcu *rcu = g_new(struct rdma_close_rcu, 1);
+
     trace_qemu_rdma_close();
 
     rdmain = rioc->rdmain;
@@ -3023,18 +3058,9 @@ static int qio_channel_rdma_close(QIOChannel *ioc,
         atomic_rcu_set(&rioc->rdmaout, NULL);
     }
 
-    synchronize_rcu();
-
-    if (rdmain) {
-        qemu_rdma_cleanup(rdmain);
-    }
-
-    if (rdmaout) {
-        qemu_rdma_cleanup(rdmaout);
-    }
-
-    g_free(rdmain);
-    g_free(rdmaout);
+    rcu->rdmain = rdmain;
+    rcu->rdmaout = rdmaout;
+    call_rcu(rcu, qio_channel_rdma_close_rcu, rcu);
 
     return 0;
 }
@@ -3130,7 +3156,7 @@ static size_t qemu_rdma_save_page(QEMUFile *f, void *opaque,
 
     CHECK_ERROR_STATE();
 
-    if (migrate_get_current()->state == MIGRATION_STATUS_POSTCOPY_ACTIVE) {
+    if (migration_in_postcopy()) {
         rcu_read_unlock();
         return RAM_SAVE_CONTROL_NOT_SUPP;
     }
@@ -3242,10 +3268,14 @@ static void rdma_cm_poll_handler(void *opaque)
 
     if (cm_event->event == RDMA_CM_EVENT_DISCONNECTED ||
         cm_event->event == RDMA_CM_EVENT_DEVICE_REMOVAL) {
-        error_report("receive cm event, cm event is %d", cm_event->event);
-        rdma->error_state = -EPIPE;
-        if (rdma->return_path) {
-            rdma->return_path->error_state = -EPIPE;
+        if (!rdma->error_state &&
+            migration_incoming_get_current()->state !=
+              MIGRATION_STATUS_COMPLETED) {
+            error_report("receive cm event, cm event is %d", cm_event->event);
+            rdma->error_state = -EPIPE;
+            if (rdma->return_path) {
+                rdma->return_path->error_state = -EPIPE;
+            }
         }
 
         if (mis->migration_incoming_co) {
@@ -3610,13 +3640,16 @@ static int qemu_rdma_registration_handle(QEMUFile *f, void *opaque)
                 }
                 chunk_start = ram_chunk_start(block, chunk);
                 chunk_end = ram_chunk_end(block, chunk + reg->chunks);
+                /* avoid "-Waddress-of-packed-member" warning */
+                uint32_t tmp_rkey = 0;
                 if (qemu_rdma_register_and_get_keys(rdma, block,
-                            (uintptr_t)host_addr, NULL, &reg_result->rkey,
+                            (uintptr_t)host_addr, NULL, &tmp_rkey,
                             chunk, chunk_start, chunk_end)) {
                     error_report("cannot get rkey");
                     ret = -EINVAL;
                     goto out;
                 }
+                reg_result->rkey = tmp_rkey;
 
                 reg_result->host_addr = (uintptr_t)block->local_host_addr;
 
@@ -3762,7 +3795,7 @@ static int qemu_rdma_registration_start(QEMUFile *f, void *opaque,
 
     CHECK_ERROR_STATE();
 
-    if (migrate_get_current()->state == MIGRATION_STATUS_POSTCOPY_ACTIVE) {
+    if (migration_in_postcopy()) {
         rcu_read_unlock();
         return 0;
     }
@@ -3797,7 +3830,7 @@ static int qemu_rdma_registration_stop(QEMUFile *f, void *opaque,
 
     CHECK_ERROR_STATE();
 
-    if (migrate_get_current()->state == MIGRATION_STATUS_POSTCOPY_ACTIVE) {
+    if (migration_in_postcopy()) {
         rcu_read_unlock();
         return 0;
     }

@@ -19,9 +19,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/hw.h"
 #include "hw/i2c/i2c.h"
+#include "hw/irq.h"
+#include "migration/vmstate.h"
+#include "qemu/module.h"
 #include "qemu/timer.h"
+#include "sysemu/reset.h"
 #include "ui/console.h"
 
 #define TYPE_LM8323 "lm8323"
@@ -66,7 +69,7 @@ typedef struct {
 
     struct {
         uint16_t file[256];
-	uint8_t faddr;
+        uint8_t faddr;
         uint8_t addr[3];
         QEMUTimer *tm[3];
     } pwm;
@@ -401,7 +404,7 @@ static int lm_i2c_event(I2CSlave *i2c, enum i2c_event event)
     return 0;
 }
 
-static int lm_i2c_rx(I2CSlave *i2c)
+static uint8_t lm_i2c_rx(I2CSlave *i2c)
 {
     LM823KbdState *s = LM8323(i2c);
 

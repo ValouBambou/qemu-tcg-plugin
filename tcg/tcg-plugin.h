@@ -35,7 +35,7 @@
 #include <glib.h>
 
 #include "qemu-common.h"
-#include "qom/cpu.h"
+#include "hw/core/cpu.h"
 
 #include "tcg.h"
 #include "tcg-op.h"

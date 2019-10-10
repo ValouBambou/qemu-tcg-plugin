@@ -2,6 +2,8 @@
 #define GEN_ICOUNT_H
 
 #include "qemu/timer.h"
+#include "qemu-common.h"
+//For clock and count_ifetch
 
 /* Helpers for instruction counting code generation.  */
 
@@ -15,7 +17,8 @@ static inline void gen_count_ifetch_start(void)
 
     count = tcg_temp_new_i64();
     tcg_gen_ld_i64(count, cpu_env,
-                   -ENV_OFFSET + offsetof(CPUState, ifetch_counter));
+                   offsetof(CPUState, ifetch_counter) -
+                   offsetof(ArchCPU, env));
     /* We emit a movi with a dummy immediate argument. Keep the insn index
      * of the movi so that we later (when we know the actual insn count)
      * can update the immediate argument with the actual insn count.  */
@@ -27,8 +30,34 @@ static inline void gen_count_ifetch_start(void)
     tcg_gen_add_i64(count, count, ninst64);
     tcg_temp_free_i64(ninst64);
     tcg_gen_st_i64(count, cpu_env,
-                   -ENV_OFFSET + offsetof(CPUState, ifetch_counter));
+                   offsetof(CPUState, ifetch_counter) -
+                   offsetof(ArchCPU, env));
     tcg_temp_free_i64(count);
+}
+
+static inline void gen_io_start(void)
+{
+    TCGv_i32 tmp = tcg_const_i32(1);
+    tcg_gen_st_i32(tmp, cpu_env,
+                   offsetof(ArchCPU, parent_obj.can_do_io) -
+                   offsetof(ArchCPU, env));
+    tcg_temp_free_i32(tmp);
+}
+
+/*
+ * cpu->can_do_io is cleared automatically at the beginning of
+ * each translation block.  The cost is minimal and only paid
+ * for -icount, plus it would be very easy to forget doing it
+ * in the translator.  Therefore, backends only need to call
+ * gen_io_start.
+ */
+static inline void gen_io_end(void)
+{
+    TCGv_i32 tmp = tcg_const_i32(0);
+    tcg_gen_st_i32(tmp, cpu_env,
+                   offsetof(ArchCPU, parent_obj.can_do_io) -
+                   offsetof(ArchCPU, env));
+    tcg_temp_free_i32(tmp);
 }
 
 static inline void gen_tb_start(TranslationBlock *tb)
@@ -47,7 +76,8 @@ static inline void gen_tb_start(TranslationBlock *tb)
     }
 
     tcg_gen_ld_i32(count, cpu_env,
-                   -ENV_OFFSET + offsetof(CPUState, icount_decr.u32));
+                   offsetof(ArchCPU, neg.icount_decr.u32) -
+                   offsetof(ArchCPU, env));
 
     if (tb_cflags(tb) & CF_USE_ICOUNT) {
         imm = tcg_temp_new_i32();
@@ -65,7 +95,9 @@ static inline void gen_tb_start(TranslationBlock *tb)
 
     if (tb_cflags(tb) & CF_USE_ICOUNT) {
         tcg_gen_st16_i32(count, cpu_env,
-                         -ENV_OFFSET + offsetof(CPUState, icount_decr.u16.low));
+                         offsetof(ArchCPU, neg.icount_decr.u16.low) -
+                         offsetof(ArchCPU, env));
+        gen_io_end();
     }
 
     tcg_temp_free_i32(count);
@@ -87,20 +119,6 @@ static inline void gen_tb_end(TranslationBlock *tb, int num_insns)
 
     gen_set_label(tcg_ctx->exitreq_label);
     tcg_gen_exit_tb(tb, TB_EXIT_REQUESTED);
-}
-
-static inline void gen_io_start(void)
-{
-    TCGv_i32 tmp = tcg_const_i32(1);
-    tcg_gen_st_i32(tmp, cpu_env, -ENV_OFFSET + offsetof(CPUState, can_do_io));
-    tcg_temp_free_i32(tmp);
-}
-
-static inline void gen_io_end(void)
-{
-    TCGv_i32 tmp = tcg_const_i32(0);
-    tcg_gen_st_i32(tmp, cpu_env, -ENV_OFFSET + offsetof(CPUState, can_do_io));
-    tcg_temp_free_i32(tmp);
 }
 
 #endif

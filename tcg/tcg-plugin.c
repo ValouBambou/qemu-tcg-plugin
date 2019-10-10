@@ -41,20 +41,13 @@
 #include <inttypes.h>
 #include <unistd.h>  /* stat(2) */
 
-#include "tcg.h"
-#include "tcg-op.h"
 #include "tcg-plugin.h"
-#include "exec/exec-all.h"   /* TranslationBlock */
-#include "qom/cpu.h"         /* CPUState */
 #include "sysemu/sysemu.h"   /* max_cpus */
 #include "qemu/log.h"        /* qemu_set_log() */
 
 #if defined(CONFIG_USER_ONLY)
 extern const char *exec_path;
 #endif
-
-/* glib must be included after osdep.h (which we include transitively via tcg.h) */
-#include <glib.h>    /* glib2 objects/functions,*/
 
 /* Definition of private externals used in tcg-plugin.inc.c. */
 __thread uint32_t _tpi_thread_tid;

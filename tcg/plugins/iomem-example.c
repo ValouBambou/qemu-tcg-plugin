@@ -37,7 +37,6 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#include "tcg-op.h"
 #include "tcg-plugin.h"
 
 static const char *quote = "Real programmers can write assembly code in any language.  :-)\n\t-- Larry Wall";
@@ -85,7 +84,7 @@ static void after_gen_opc(const TCGPluginInterface *tpi, const TPIOpCode *tpi_op
         return;
     }
 
-    TCGMemOp opc = get_memop(tpi_opcode->opargs[2]);
+    MemOp opc = get_memop(tpi_opcode->opargs[2]);
     size = 1 << (opc & MO_SIZE);
     sign = (opc & MO_SIGN) != 0 ? -1: 1;
 

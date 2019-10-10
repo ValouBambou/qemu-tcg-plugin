@@ -159,18 +159,44 @@ out:
     return ret;
 }
 
+static bool ramblock_is_ignored(RAMBlock *block)
+{
+    return !qemu_ram_is_migratable(block) ||
+           (migrate_ignore_shared() && qemu_ram_is_shared(block));
+}
+
 /* Should be holding either ram_list.mutex, or the RCU lock. */
+#define RAMBLOCK_FOREACH_NOT_IGNORED(block)            \
+    INTERNAL_RAMBLOCK_FOREACH(block)                   \
+        if (ramblock_is_ignored(block)) {} else
+
 #define RAMBLOCK_FOREACH_MIGRATABLE(block)             \
     INTERNAL_RAMBLOCK_FOREACH(block)                   \
         if (!qemu_ram_is_migratable(block)) {} else
 
 #undef RAMBLOCK_FOREACH
 
+int foreach_not_ignored_block(RAMBlockIterFunc func, void *opaque)
+{
+    RAMBlock *block;
+    int ret = 0;
+
+    rcu_read_lock();
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+        ret = func(block, opaque);
+        if (ret) {
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return ret;
+}
+
 static void ramblock_recv_map_init(void)
 {
     RAMBlock *rb;
 
-    RAMBLOCK_FOREACH_MIGRATABLE(rb) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
         assert(!rb->receivedmap);
         rb->receivedmap = bitmap_new(rb->max_length >> qemu_target_page_bits());
     }
@@ -290,6 +316,8 @@ struct RAMState {
     uint32_t last_version;
     /* We are in the first round */
     bool ram_bulk_stage;
+    /* The free page optimization is enabled */
+    bool fpo_enabled;
     /* How many times we have dirty too many pages */
     int dirty_rate_high_cnt;
     /* these variables are used for bitmap sync */
@@ -316,17 +344,52 @@ struct RAMState {
     uint64_t target_page_count;
     /* number of dirty bits in the bitmap */
     uint64_t migration_dirty_pages;
-    /* protects modification of the bitmap */
+    /* Protects modification of the bitmap and migration dirty pages */
     QemuMutex bitmap_mutex;
     /* The RAMBlock used in the last src_page_requests */
     RAMBlock *last_req_rb;
     /* Queue of outstanding page requests from the destination */
     QemuMutex src_page_req_mutex;
-    QSIMPLEQ_HEAD(src_page_requests, RAMSrcPageRequest) src_page_requests;
+    QSIMPLEQ_HEAD(, RAMSrcPageRequest) src_page_requests;
 };
 typedef struct RAMState RAMState;
 
 static RAMState *ram_state;
+
+static NotifierWithReturnList precopy_notifier_list;
+
+void precopy_infrastructure_init(void)
+{
+    notifier_with_return_list_init(&precopy_notifier_list);
+}
+
+void precopy_add_notifier(NotifierWithReturn *n)
+{
+    notifier_with_return_list_add(&precopy_notifier_list, n);
+}
+
+void precopy_remove_notifier(NotifierWithReturn *n)
+{
+    notifier_with_return_remove(n);
+}
+
+int precopy_notify(PrecopyNotifyReason reason, Error **errp)
+{
+    PrecopyNotifyData pnd;
+    pnd.reason = reason;
+    pnd.errp = errp;
+
+    return notifier_with_return_list_notify(&precopy_notifier_list, &pnd);
+}
+
+void precopy_enable_free_page_optimization(void)
+{
+    if (!ram_state) {
+        return;
+    }
+
+    ram_state->fpo_enabled = true;
+}
 
 uint64_t ram_bytes_remaining(void)
 {
@@ -520,20 +583,29 @@ exit:
 
 #define MULTIFD_FLAG_SYNC (1 << 0)
 
+/* This value needs to be a multiple of qemu_target_page_size() */
+#define MULTIFD_PACKET_SIZE (512 * 1024)
+
 typedef struct {
     uint32_t magic;
     uint32_t version;
     unsigned char uuid[16]; /* QemuUUID */
     uint8_t id;
+    uint8_t unused1[7];     /* Reserved for future use */
+    uint64_t unused2[4];    /* Reserved for future use */
 } __attribute__((packed)) MultiFDInit_t;
 
 typedef struct {
     uint32_t magic;
     uint32_t version;
     uint32_t flags;
-    uint32_t size;
-    uint32_t used;
+    /* maximum number of allocated pages */
+    uint32_t pages_alloc;
+    uint32_t pages_used;
+    /* size of the next packet that contains pages */
+    uint32_t next_packet_size;
     uint64_t packet_num;
+    uint64_t unused[4];    /* Reserved for future use */
     char ramblock[256];
     uint64_t offset[];
 } __attribute__((packed)) MultiFDPacket_t;
@@ -580,6 +652,8 @@ typedef struct {
     MultiFDPacket_t *packet;
     /* multifd flags for each packet */
     uint32_t flags;
+    /* size of the next packet that contains pages */
+    uint32_t next_packet_size;
     /* global number of generated multifd packets */
     uint64_t packet_num;
     /* thread local variables */
@@ -605,6 +679,8 @@ typedef struct {
     QemuMutex mutex;
     /* is this channel thread running */
     bool running;
+    /* should this thread finish */
+    bool quit;
     /* array of pages to receive */
     MultiFDPages_t *pages;
     /* packet allocated len */
@@ -616,6 +692,8 @@ typedef struct {
     /* global number of generated multifd packets */
     uint64_t packet_num;
     /* thread local variables */
+    /* size of the next packet that contains pages */
+    uint32_t next_packet_size;
     /* packets sent through this channel */
     uint64_t num_packets;
     /* pages sent through this channel */
@@ -713,13 +791,15 @@ static void multifd_pages_clear(MultiFDPages_t *pages)
 static void multifd_send_fill_packet(MultiFDSendParams *p)
 {
     MultiFDPacket_t *packet = p->packet;
+    uint32_t page_max = MULTIFD_PACKET_SIZE / qemu_target_page_size();
     int i;
 
     packet->magic = cpu_to_be32(MULTIFD_MAGIC);
     packet->version = cpu_to_be32(MULTIFD_VERSION);
     packet->flags = cpu_to_be32(p->flags);
-    packet->size = cpu_to_be32(migrate_multifd_page_count());
-    packet->used = cpu_to_be32(p->pages->used);
+    packet->pages_alloc = cpu_to_be32(page_max);
+    packet->pages_used = cpu_to_be32(p->pages->used);
+    packet->next_packet_size = cpu_to_be32(p->next_packet_size);
     packet->packet_num = cpu_to_be64(p->packet_num);
 
     if (p->pages->block) {
@@ -734,6 +814,7 @@ static void multifd_send_fill_packet(MultiFDSendParams *p)
 static int multifd_recv_unfill_packet(MultiFDRecvParams *p, Error **errp)
 {
     MultiFDPacket_t *packet = p->packet;
+    uint32_t pages_max = MULTIFD_PACKET_SIZE / qemu_target_page_size();
     RAMBlock *block;
     int i;
 
@@ -755,22 +836,35 @@ static int multifd_recv_unfill_packet(MultiFDRecvParams *p, Error **errp)
 
     p->flags = be32_to_cpu(packet->flags);
 
-    packet->size = be32_to_cpu(packet->size);
-    if (packet->size > migrate_multifd_page_count()) {
+    packet->pages_alloc = be32_to_cpu(packet->pages_alloc);
+    /*
+     * If we recevied a packet that is 100 times bigger than expected
+     * just stop migration.  It is a magic number.
+     */
+    if (packet->pages_alloc > pages_max * 100) {
         error_setg(errp, "multifd: received packet "
-                   "with size %d and expected maximum size %d",
-                   packet->size, migrate_multifd_page_count()) ;
+                   "with size %d and expected a maximum size of %d",
+                   packet->pages_alloc, pages_max * 100) ;
+        return -1;
+    }
+    /*
+     * We received a packet that is bigger than expected but inside
+     * reasonable limits (see previous comment).  Just reallocate.
+     */
+    if (packet->pages_alloc > p->pages->allocated) {
+        multifd_pages_clear(p->pages);
+        p->pages = multifd_pages_init(packet->pages_alloc);
+    }
+
+    p->pages->used = be32_to_cpu(packet->pages_used);
+    if (p->pages->used > packet->pages_alloc) {
+        error_setg(errp, "multifd: received packet "
+                   "with %d pages and expected maximum pages are %d",
+                   p->pages->used, packet->pages_alloc) ;
         return -1;
     }
 
-    p->pages->used = be32_to_cpu(packet->used);
-    if (p->pages->used > packet->size) {
-        error_setg(errp, "multifd: received packet "
-                   "with size %d and expected maximum size %d",
-                   p->pages->used, packet->size) ;
-        return -1;
-    }
-
+    p->next_packet_size = be32_to_cpu(packet->next_packet_size);
     p->packet_num = be64_to_cpu(packet->packet_num);
 
     if (p->pages->used) {
@@ -802,12 +896,8 @@ static int multifd_recv_unfill_packet(MultiFDRecvParams *p, Error **errp)
 
 struct {
     MultiFDSendParams *params;
-    /* number of created threads */
-    int count;
     /* array of pages to sent */
     MultiFDPages_t *pages;
-    /* syncs main thread and channels */
-    QemuSemaphore sem_sync;
     /* global number of generated multifd packets */
     uint64_t packet_num;
     /* send channels ready */
@@ -825,14 +915,14 @@ struct {
  *    - to make easier to know what to free at the end of migration
  *
  * This way we always know who is the owner of each "pages" struct,
- * and we don't need any loocking.  It belongs to the migration thread
+ * and we don't need any locking.  It belongs to the migration thread
  * or to the channel thread.  Switching is safe because the migration
  * thread is using the channel mutex when changing it, and the channel
  * have to had finish with its own, otherwise pending_job can't be
  * false.
  */
 
-static void multifd_send_pages(void)
+static int multifd_send_pages(RAMState *rs)
 {
     int i;
     static int next_channel;
@@ -845,6 +935,11 @@ static void multifd_send_pages(void)
         p = &multifd_send_state->params[i];
 
         qemu_mutex_lock(&p->mutex);
+        if (p->quit) {
+            error_report("%s: channel %d has already quit!", __func__, i);
+            qemu_mutex_unlock(&p->mutex);
+            return -1;
+        }
         if (!p->pending_job) {
             p->pending_job++;
             next_channel = (i + 1) % migrate_multifd_channels();
@@ -859,13 +954,16 @@ static void multifd_send_pages(void)
     multifd_send_state->pages = p->pages;
     p->pages = pages;
     transferred = ((uint64_t) pages->used) * TARGET_PAGE_SIZE + p->packet_len;
+    qemu_file_update_transfer(rs->f, transferred);
     ram_counters.multifd_bytes += transferred;
     ram_counters.transferred += transferred;;
     qemu_mutex_unlock(&p->mutex);
     qemu_sem_post(&p->sem);
+
+    return 1;
 }
 
-static void multifd_queue_page(RAMBlock *block, ram_addr_t offset)
+static int multifd_queue_page(RAMState *rs, RAMBlock *block, ram_addr_t offset)
 {
     MultiFDPages_t *pages = multifd_send_state->pages;
 
@@ -880,20 +978,26 @@ static void multifd_queue_page(RAMBlock *block, ram_addr_t offset)
         pages->used++;
 
         if (pages->used < pages->allocated) {
-            return;
+            return 1;
         }
     }
 
-    multifd_send_pages();
+    if (multifd_send_pages(rs) < 0) {
+        return -1;
+    }
 
     if (pages->block != block) {
-        multifd_queue_page(block, offset);
+        return  multifd_queue_page(rs, block, offset);
     }
+
+    return 1;
 }
 
 static void multifd_send_terminate_threads(Error *err)
 {
     int i;
+
+    trace_multifd_send_terminate_threads(err != NULL);
 
     if (err) {
         MigrationState *s = migrate_get_current();
@@ -917,13 +1021,12 @@ static void multifd_send_terminate_threads(Error *err)
     }
 }
 
-int multifd_save_cleanup(Error **errp)
+void multifd_save_cleanup(void)
 {
     int i;
-    int ret = 0;
 
     if (!migrate_use_multifd()) {
-        return 0;
+        return;
     }
     multifd_send_terminate_threads(NULL);
     for (i = 0; i < migrate_multifd_channels(); i++) {
@@ -946,17 +1049,15 @@ int multifd_save_cleanup(Error **errp)
         p->packet = NULL;
     }
     qemu_sem_destroy(&multifd_send_state->channels_ready);
-    qemu_sem_destroy(&multifd_send_state->sem_sync);
     g_free(multifd_send_state->params);
     multifd_send_state->params = NULL;
     multifd_pages_clear(multifd_send_state->pages);
     multifd_send_state->pages = NULL;
     g_free(multifd_send_state);
     multifd_send_state = NULL;
-    return ret;
 }
 
-static void multifd_send_sync_main(void)
+static void multifd_send_sync_main(RAMState *rs)
 {
     int i;
 
@@ -964,7 +1065,10 @@ static void multifd_send_sync_main(void)
         return;
     }
     if (multifd_send_state->pages->used) {
-        multifd_send_pages();
+        if (multifd_send_pages(rs) < 0) {
+            error_report("%s: multifd_send_pages fail", __func__);
+            return;
+        }
     }
     for (i = 0; i < migrate_multifd_channels(); i++) {
         MultiFDSendParams *p = &multifd_send_state->params[i];
@@ -973,9 +1077,18 @@ static void multifd_send_sync_main(void)
 
         qemu_mutex_lock(&p->mutex);
 
+        if (p->quit) {
+            error_report("%s: channel %d has already quit", __func__, i);
+            qemu_mutex_unlock(&p->mutex);
+            return;
+        }
+
         p->packet_num = multifd_send_state->packet_num++;
         p->flags |= MULTIFD_FLAG_SYNC;
         p->pending_job++;
+        qemu_file_update_transfer(rs->f, p->packet_len);
+        ram_counters.multifd_bytes += p->packet_len;
+        ram_counters.transferred += p->packet_len;
         qemu_mutex_unlock(&p->mutex);
         qemu_sem_post(&p->sem);
     }
@@ -983,7 +1096,7 @@ static void multifd_send_sync_main(void)
         MultiFDSendParams *p = &multifd_send_state->params[i];
 
         trace_multifd_send_sync_main_wait(p->id);
-        qemu_sem_wait(&multifd_send_state->sem_sync);
+        qemu_sem_wait(&p->sem_sync);
     }
     trace_multifd_send_sync_main(multifd_send_state->packet_num);
 }
@@ -992,12 +1105,14 @@ static void *multifd_send_thread(void *opaque)
 {
     MultiFDSendParams *p = opaque;
     Error *local_err = NULL;
-    int ret;
+    int ret = 0;
+    uint32_t flags = 0;
 
     trace_multifd_send_thread_start(p->id);
     rcu_register_thread();
 
     if (multifd_send_initial_packet(p, &local_err) < 0) {
+        ret = -1;
         goto out;
     }
     /* initial packet */
@@ -1010,8 +1125,9 @@ static void *multifd_send_thread(void *opaque)
         if (p->pending_job) {
             uint32_t used = p->pages->used;
             uint64_t packet_num = p->packet_num;
-            uint32_t flags = p->flags;
+            flags = p->flags;
 
+            p->next_packet_size = used * qemu_target_page_size();
             multifd_send_fill_packet(p);
             p->flags = 0;
             p->num_packets++;
@@ -1019,7 +1135,8 @@ static void *multifd_send_thread(void *opaque)
             p->pages->used = 0;
             qemu_mutex_unlock(&p->mutex);
 
-            trace_multifd_send(p->id, packet_num, used, flags);
+            trace_multifd_send(p->id, packet_num, used, flags,
+                               p->next_packet_size);
 
             ret = qio_channel_write_all(p->c, (void *)p->packet,
                                         p->packet_len, &local_err);
@@ -1027,9 +1144,12 @@ static void *multifd_send_thread(void *opaque)
                 break;
             }
 
-            ret = qio_channel_writev_all(p->c, p->pages->iov, used, &local_err);
-            if (ret != 0) {
-                break;
+            if (used) {
+                ret = qio_channel_writev_all(p->c, p->pages->iov,
+                                             used, &local_err);
+                if (ret != 0) {
+                    break;
+                }
             }
 
             qemu_mutex_lock(&p->mutex);
@@ -1037,7 +1157,7 @@ static void *multifd_send_thread(void *opaque)
             qemu_mutex_unlock(&p->mutex);
 
             if (flags & MULTIFD_FLAG_SYNC) {
-                qemu_sem_post(&multifd_send_state->sem_sync);
+                qemu_sem_post(&p->sem_sync);
             }
             qemu_sem_post(&multifd_send_state->channels_ready);
         } else if (p->quit) {
@@ -1051,7 +1171,17 @@ static void *multifd_send_thread(void *opaque)
 
 out:
     if (local_err) {
+        trace_multifd_send_error(p->id);
         multifd_send_terminate_threads(local_err);
+    }
+
+    /*
+     * Error happen, I will exit, but I can't just leave, tell
+     * who pay attention to me.
+     */
+    if (ret != 0) {
+        qemu_sem_post(&p->sem_sync);
+        qemu_sem_post(&multifd_send_state->channels_ready);
     }
 
     qemu_mutex_lock(&p->mutex);
@@ -1070,25 +1200,23 @@ static void multifd_new_send_channel_async(QIOTask *task, gpointer opaque)
     QIOChannel *sioc = QIO_CHANNEL(qio_task_get_source(task));
     Error *local_err = NULL;
 
+    trace_multifd_new_send_channel_async(p->id);
     if (qio_task_propagate_error(task, &local_err)) {
-        if (multifd_save_cleanup(&local_err) != 0) {
-            migrate_set_error(migrate_get_current(), local_err);
-        }
+        migrate_set_error(migrate_get_current(), local_err);
+        multifd_save_cleanup();
     } else {
         p->c = QIO_CHANNEL(sioc);
         qio_channel_set_delay(p->c, false);
         p->running = true;
         qemu_thread_create(&p->thread, p->name, multifd_send_thread, p,
                            QEMU_THREAD_JOINABLE);
-
-        atomic_inc(&multifd_send_state->count);
     }
 }
 
 int multifd_save_setup(void)
 {
     int thread_count;
-    uint32_t page_count = migrate_multifd_page_count();
+    uint32_t page_count = MULTIFD_PACKET_SIZE / qemu_target_page_size();
     uint8_t i;
 
     if (!migrate_use_multifd()) {
@@ -1097,9 +1225,7 @@ int multifd_save_setup(void)
     thread_count = migrate_multifd_channels();
     multifd_send_state = g_malloc0(sizeof(*multifd_send_state));
     multifd_send_state->params = g_new0(MultiFDSendParams, thread_count);
-    atomic_set(&multifd_send_state->count, 0);
     multifd_send_state->pages = multifd_pages_init(page_count);
-    qemu_sem_init(&multifd_send_state->sem_sync, 0);
     qemu_sem_init(&multifd_send_state->channels_ready, 0);
 
     for (i = 0; i < thread_count; i++) {
@@ -1135,6 +1261,8 @@ static void multifd_recv_terminate_threads(Error *err)
 {
     int i;
 
+    trace_multifd_recv_terminate_threads(err != NULL);
+
     if (err) {
         MigrationState *s = migrate_get_current();
         migrate_set_error(s, err);
@@ -1149,6 +1277,7 @@ static void multifd_recv_terminate_threads(Error *err)
         MultiFDRecvParams *p = &multifd_recv_state->params[i];
 
         qemu_mutex_lock(&p->mutex);
+        p->quit = true;
         /* We could arrive here for two reasons:
            - normal quit, i.e. everything went fine, just finished
            - error quit: We close the channels so the channel threads
@@ -1171,6 +1300,12 @@ int multifd_load_cleanup(Error **errp)
         MultiFDRecvParams *p = &multifd_recv_state->params[i];
 
         if (p->running) {
+            p->quit = true;
+            /*
+             * multifd_recv_thread may hung at MULTIFD_FLAG_SYNC handle code,
+             * however try to wakeup it without harm in cleanup phase.
+             */
+            qemu_sem_post(&p->sem_sync);
             qemu_thread_join(&p->thread);
         }
         object_unref(OBJECT(p->c));
@@ -1206,15 +1341,15 @@ static void multifd_recv_sync_main(void)
 
         trace_multifd_recv_sync_main_wait(p->id);
         qemu_sem_wait(&multifd_recv_state->sem_sync);
+    }
+    for (i = 0; i < migrate_multifd_channels(); i++) {
+        MultiFDRecvParams *p = &multifd_recv_state->params[i];
+
         qemu_mutex_lock(&p->mutex);
         if (multifd_recv_state->packet_num < p->packet_num) {
             multifd_recv_state->packet_num = p->packet_num;
         }
         qemu_mutex_unlock(&p->mutex);
-    }
-    for (i = 0; i < migrate_multifd_channels(); i++) {
-        MultiFDRecvParams *p = &multifd_recv_state->params[i];
-
         trace_multifd_recv_sync_main_signal(p->id);
         qemu_sem_post(&p->sem_sync);
     }
@@ -1234,6 +1369,10 @@ static void *multifd_recv_thread(void *opaque)
         uint32_t used;
         uint32_t flags;
 
+        if (p->quit) {
+            break;
+        }
+
         ret = qio_channel_read_all_eof(p->c, (void *)p->packet,
                                        p->packet_len, &local_err);
         if (ret == 0) {   /* EOF */
@@ -1252,14 +1391,18 @@ static void *multifd_recv_thread(void *opaque)
 
         used = p->pages->used;
         flags = p->flags;
-        trace_multifd_recv(p->id, p->packet_num, used, flags);
+        trace_multifd_recv(p->id, p->packet_num, used, flags,
+                           p->next_packet_size);
         p->num_packets++;
         p->num_pages += used;
         qemu_mutex_unlock(&p->mutex);
 
-        ret = qio_channel_readv_all(p->c, p->pages->iov, used, &local_err);
-        if (ret != 0) {
-            break;
+        if (used) {
+            ret = qio_channel_readv_all(p->c, p->pages->iov,
+                                        used, &local_err);
+            if (ret != 0) {
+                break;
+            }
         }
 
         if (flags & MULTIFD_FLAG_SYNC) {
@@ -1284,7 +1427,7 @@ static void *multifd_recv_thread(void *opaque)
 int multifd_load_setup(void)
 {
     int thread_count;
-    uint32_t page_count = migrate_multifd_page_count();
+    uint32_t page_count = MULTIFD_PACKET_SIZE / qemu_target_page_size();
     uint8_t i;
 
     if (!migrate_use_multifd()) {
@@ -1301,6 +1444,7 @@ int multifd_load_setup(void)
 
         qemu_mutex_init(&p->mutex);
         qemu_sem_init(&p->sem_sync, 0);
+        p->quit = false;
         p->id = i;
         p->pages = multifd_pages_init(page_count);
         p->packet_len = sizeof(MultiFDPacket_t)
@@ -1322,8 +1466,13 @@ bool multifd_recv_all_channels_created(void)
     return thread_count == atomic_read(&multifd_recv_state->count);
 }
 
-/* Return true if multifd is ready for the migration, otherwise false */
-bool multifd_recv_new_channel(QIOChannel *ioc)
+/*
+ * Try to receive all multifd channels to get ready for the migration.
+ * - Return true and do not set @errp when correctly receving all channels;
+ * - Return false and do not set @errp when correctly receiving the current one;
+ * - Return false and set @errp when failing to receive the current channel.
+ */
+bool multifd_recv_new_channel(QIOChannel *ioc, Error **errp)
 {
     MultiFDRecvParams *p;
     Error *local_err = NULL;
@@ -1332,14 +1481,20 @@ bool multifd_recv_new_channel(QIOChannel *ioc)
     id = multifd_recv_initial_packet(ioc, &local_err);
     if (id < 0) {
         multifd_recv_terminate_threads(local_err);
+        error_propagate_prepend(errp, local_err,
+                                "failed to receive packet"
+                                " via multifd channel %d: ",
+                                atomic_read(&multifd_recv_state->count));
         return false;
     }
+    trace_multifd_recv_new_channel(id);
 
     p = &multifd_recv_state->params[id];
     if (p->c != NULL) {
         error_setg(&local_err, "multifd: received id '%d' already setup'",
                    id);
         multifd_recv_terminate_threads(local_err);
+        error_propagate(errp, local_err);
         return false;
     }
     p->c = ioc;
@@ -1351,7 +1506,8 @@ bool multifd_recv_new_channel(QIOChannel *ioc)
     qemu_thread_create(&p->thread, p->name, multifd_recv_thread, p,
                        QEMU_THREAD_JOINABLE);
     atomic_inc(&multifd_recv_state->count);
-    return multifd_recv_state->count == migrate_multifd_channels();
+    return atomic_read(&multifd_recv_state->count) ==
+           migrate_multifd_channels();
 }
 
 /**
@@ -1485,23 +1641,28 @@ static int save_xbzrle_page(RAMState *rs, uint8_t **current_data,
     encoded_len = xbzrle_encode_buffer(prev_cached_page, XBZRLE.current_buf,
                                        TARGET_PAGE_SIZE, XBZRLE.encoded_buf,
                                        TARGET_PAGE_SIZE);
+
+    /*
+     * Update the cache contents, so that it corresponds to the data
+     * sent, in all cases except where we skip the page.
+     */
+    if (!last_stage && encoded_len != 0) {
+        memcpy(prev_cached_page, XBZRLE.current_buf, TARGET_PAGE_SIZE);
+        /*
+         * In the case where we couldn't compress, ensure that the caller
+         * sends the data from the cache, since the guest might have
+         * changed the RAM since we copied it.
+         */
+        *current_data = prev_cached_page;
+    }
+
     if (encoded_len == 0) {
         trace_save_xbzrle_page_skipping();
         return 0;
     } else if (encoded_len == -1) {
         trace_save_xbzrle_page_overflow();
         xbzrle_counters.overflow++;
-        /* update data in the cache */
-        if (!last_stage) {
-            memcpy(prev_cached_page, *current_data, TARGET_PAGE_SIZE);
-            *current_data = prev_cached_page;
-        }
         return -1;
-    }
-
-    /* we need to update the data in the cache, in order to get the same data */
-    if (!last_stage) {
-        memcpy(prev_cached_page, XBZRLE.current_buf, TARGET_PAGE_SIZE);
     }
 
     /* Send XBZRLE based compressed page */
@@ -1521,9 +1682,7 @@ static int save_xbzrle_page(RAMState *rs, uint8_t **current_data,
 /**
  * migration_bitmap_find_dirty: find the next dirty page from start
  *
- * Called with rcu_read_lock() to protect migration_bitmap
- *
- * Returns the byte offset within memory region of the start of a dirty page
+ * Returns the page offset within memory region of the start of a dirty page
  *
  * @rs: current RAM state
  * @rb: RAMBlock where to search for dirty pages
@@ -1537,11 +1696,15 @@ unsigned long migration_bitmap_find_dirty(RAMState *rs, RAMBlock *rb,
     unsigned long *bitmap = rb->bmap;
     unsigned long next;
 
-    if (!qemu_ram_is_migratable(rb)) {
+    if (ramblock_is_ignored(rb)) {
         return size;
     }
 
-    if (rs->ram_bulk_stage && start > 0) {
+    /*
+     * When the free page optimization is enabled, we need to check the bitmap
+     * to send the non-free pages rather than all the pages in the bulk stage.
+     */
+    if (!rs->fpo_enabled && rs->ram_bulk_stage && start > 0) {
         next = start + 1;
     } else {
         next = find_next_bit(bitmap, size, start);
@@ -1556,19 +1719,49 @@ static inline bool migration_bitmap_clear_dirty(RAMState *rs,
 {
     bool ret;
 
+    qemu_mutex_lock(&rs->bitmap_mutex);
+
+    /*
+     * Clear dirty bitmap if needed.  This _must_ be called before we
+     * send any of the page in the chunk because we need to make sure
+     * we can capture further page content changes when we sync dirty
+     * log the next time.  So as long as we are going to send any of
+     * the page in the chunk we clear the remote dirty bitmap for all.
+     * Clearing it earlier won't be a problem, but too late will.
+     */
+    if (rb->clear_bmap && clear_bmap_test_and_clear(rb, page)) {
+        uint8_t shift = rb->clear_bmap_shift;
+        hwaddr size = 1ULL << (TARGET_PAGE_BITS + shift);
+        hwaddr start = (page << TARGET_PAGE_BITS) & (-size);
+
+        /*
+         * CLEAR_BITMAP_SHIFT_MIN should always guarantee this... this
+         * can make things easier sometimes since then start address
+         * of the small chunk will always be 64 pages aligned so the
+         * bitmap will always be aligned to unsigned long.  We should
+         * even be able to remove this restriction but I'm simply
+         * keeping it.
+         */
+        assert(shift >= 6);
+        trace_migration_bitmap_clear_dirty(rb->idstr, start, size, page);
+        memory_region_clear_dirty_bitmap(rb->mr, start, size);
+    }
+
     ret = test_and_clear_bit(page, rb->bmap);
 
     if (ret) {
         rs->migration_dirty_pages--;
     }
+    qemu_mutex_unlock(&rs->bitmap_mutex);
+
     return ret;
 }
 
-static void migration_bitmap_sync_range(RAMState *rs, RAMBlock *rb,
-                                        ram_addr_t start, ram_addr_t length)
+/* Called with RCU critical section */
+static void ramblock_sync_dirty_bitmap(RAMState *rs, RAMBlock *rb)
 {
     rs->migration_dirty_pages +=
-        cpu_physical_memory_sync_dirty_bitmap(rb, start, length,
+        cpu_physical_memory_sync_dirty_bitmap(rb, 0, rb->used_length,
                                               &rs->num_dirty_pages_period);
 }
 
@@ -1586,11 +1779,17 @@ uint64_t ram_pagesize_summary(void)
     RAMBlock *block;
     uint64_t summary = 0;
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         summary |= block->page_size;
     }
 
     return summary;
+}
+
+uint64_t ram_get_total_transferred_pages(void)
+{
+    return  ram_counters.normal + ram_counters.duplicate +
+                compression_counters.pages + xbzrle_counters.pages;
 }
 
 static void migration_update_rates(RAMState *rs, int64_t end_time)
@@ -1650,13 +1849,14 @@ static void migration_bitmap_sync(RAMState *rs)
 
     qemu_mutex_lock(&rs->bitmap_mutex);
     rcu_read_lock();
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
-        migration_bitmap_sync_range(rs, block, 0, block->used_length);
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+        ramblock_sync_dirty_bitmap(rs, block);
     }
     ram_counters.remaining = ram_bytes_remaining();
     rcu_read_unlock();
     qemu_mutex_unlock(&rs->bitmap_mutex);
 
+    memory_global_after_dirty_log_sync();
     trace_migration_bitmap_sync_end(rs->num_dirty_pages_period);
 
     end_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -1695,6 +1895,25 @@ static void migration_bitmap_sync(RAMState *rs)
     }
     if (migrate_use_events()) {
         qapi_event_send_migration_pass(ram_counters.dirty_sync_count);
+    }
+}
+
+static void migration_bitmap_sync_precopy(RAMState *rs)
+{
+    Error *local_err = NULL;
+
+    /*
+     * The current notifier usage is just an optimization to migration, so we
+     * don't stop the normal migration process in the error case.
+     */
+    if (precopy_notify(PRECOPY_NOTIFY_BEFORE_BITMAP_SYNC, &local_err)) {
+        error_report_err(local_err);
+    }
+
+    migration_bitmap_sync(rs);
+
+    if (precopy_notify(PRECOPY_NOTIFY_AFTER_BITMAP_SYNC, &local_err)) {
+        error_report_err(local_err);
     }
 }
 
@@ -1870,7 +2089,9 @@ static int ram_save_page(RAMState *rs, PageSearchStatus *pss, bool last_stage)
 static int ram_save_multifd_page(RAMState *rs, RAMBlock *block,
                                  ram_addr_t offset)
 {
-    multifd_queue_page(block, offset);
+    if (multifd_queue_page(rs, block, offset) < 0) {
+        return -1;
+    }
     ram_counters.normal++;
 
     return 1;
@@ -2005,7 +2226,7 @@ retry:
  * find_dirty_block: find the next dirty page and update any state
  * associated with the search process.
  *
- * Returns if a page is found
+ * Returns true if a page is found
  *
  * @rs: current RAM state
  * @pss: data about the state of the current dirty page scan
@@ -2097,11 +2318,11 @@ static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset)
 }
 
 /**
- * get_queued_page: unqueue a page from the postocpy requests
+ * get_queued_page: unqueue a page from the postcopy requests
  *
  * Skips pages that are already sent (!dirty)
  *
- * Returns if a queued page is found
+ * Returns true if a queued page is found
  *
  * @rs: current RAM state
  * @pss: data about the state of the current dirty page scan
@@ -2127,7 +2348,7 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
             dirty = test_bit(page, block->bmap);
             if (!dirty) {
                 trace_get_queued_page_not_dirty(block->idstr, (uint64_t)offset,
-                       page, test_bit(page, block->unsentmap));
+                                                page);
             } else {
                 trace_get_queued_page(block->idstr, (uint64_t)offset, page);
             }
@@ -2151,6 +2372,12 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          */
         pss->block = block;
         pss->page = offset >> TARGET_PAGE_BITS;
+
+        /*
+         * This unqueued page would break the "one round" check, even is
+         * really rare.
+         */
+        pss->complete_round = false;
     }
 
     return !!block;
@@ -2374,7 +2601,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss,
     size_t pagesize_bits =
         qemu_ram_pagesize(pss->block) >> TARGET_PAGE_BITS;
 
-    if (!qemu_ram_is_migratable(pss->block)) {
+    if (ramblock_is_ignored(pss->block)) {
         error_report("block %s should not be migrated !", pss->block->idstr);
         return 0;
     }
@@ -2392,10 +2619,6 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss,
         }
 
         pages += tmppages;
-        if (pss->block->unsentmap) {
-            clear_bit(pss->page, pss->block->unsentmap);
-        }
-
         pss->page++;
     } while ((pss->page & (pagesize_bits - 1)) &&
              offset_in_ramblock(pss->block, pss->page << TARGET_PAGE_BITS));
@@ -2472,17 +2695,28 @@ void acct_update_position(QEMUFile *f, size_t size, bool zero)
     }
 }
 
-uint64_t ram_bytes_total(void)
+static uint64_t ram_bytes_total_common(bool count_ignored)
 {
     RAMBlock *block;
     uint64_t total = 0;
 
     rcu_read_lock();
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
-        total += block->used_length;
+    if (count_ignored) {
+        RAMBLOCK_FOREACH_MIGRATABLE(block) {
+            total += block->used_length;
+        }
+    } else {
+        RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+            total += block->used_length;
+        }
     }
     rcu_read_unlock();
     return total;
+}
+
+uint64_t ram_bytes_total(void)
+{
+    return ram_bytes_total_common(false);
 }
 
 static void xbzrle_load_setup(void)
@@ -2529,15 +2763,15 @@ static void ram_save_cleanup(void *opaque)
     RAMBlock *block;
 
     /* caller have hold iothread lock or is in a bh, so there is
-     * no writing race against this migration_bitmap
+     * no writing race against the migration bitmap
      */
     memory_global_dirty_log_stop();
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+        g_free(block->clear_bmap);
+        block->clear_bmap = NULL;
         g_free(block->bmap);
         block->bmap = NULL;
-        g_free(block->unsentmap);
-        block->unsentmap = NULL;
     }
 
     xbzrle_cleanup();
@@ -2552,6 +2786,7 @@ static void ram_state_reset(RAMState *rs)
     rs->last_page = 0;
     rs->last_version = ram_list.version;
     rs->ram_bulk_stage = true;
+    rs->fpo_enabled = false;
 }
 
 #define MAX_WAIT 50 /* ms, half buffered_file limit */
@@ -2596,7 +2831,7 @@ void ram_postcopy_migrated_memory_release(MigrationState *ms)
 {
     struct RAMBlock *block;
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         unsigned long *bitmap = block->bmap;
         unsigned long range = block->used_length >> TARGET_PAGE_BITS;
         unsigned long run_start = find_next_zero_bit(bitmap, range, 0);
@@ -2616,41 +2851,33 @@ void ram_postcopy_migrated_memory_release(MigrationState *ms)
  * Returns zero on success
  *
  * Callback from postcopy_each_ram_send_discard for each RAMBlock
- * Note: At this point the 'unsentmap' is the processed bitmap combined
- *       with the dirtymap; so a '1' means it's either dirty or unsent.
  *
  * @ms: current migration state
- * @pds: state for postcopy
- * @start: RAMBlock starting page
- * @length: RAMBlock size
+ * @block: RAMBlock to discard
  */
-static int postcopy_send_discard_bm_ram(MigrationState *ms,
-                                        PostcopyDiscardState *pds,
-                                        RAMBlock *block)
+static int postcopy_send_discard_bm_ram(MigrationState *ms, RAMBlock *block)
 {
     unsigned long end = block->used_length >> TARGET_PAGE_BITS;
     unsigned long current;
-    unsigned long *unsentmap = block->unsentmap;
+    unsigned long *bitmap = block->bmap;
 
     for (current = 0; current < end; ) {
-        unsigned long one = find_next_bit(unsentmap, end, current);
+        unsigned long one = find_next_bit(bitmap, end, current);
+        unsigned long zero, discard_length;
 
-        if (one <= end) {
-            unsigned long zero = find_next_zero_bit(unsentmap, end, one + 1);
-            unsigned long discard_length;
-
-            if (zero >= end) {
-                discard_length = end - one;
-            } else {
-                discard_length = zero - one;
-            }
-            if (discard_length) {
-                postcopy_discard_send_range(ms, pds, one, discard_length);
-            }
-            current = one + discard_length;
-        } else {
-            current = one;
+        if (one >= end) {
+            break;
         }
+
+        zero = find_next_zero_bit(bitmap, end, one + 1);
+
+        if (zero >= end) {
+            discard_length = end - one;
+        } else {
+            discard_length = zero - one;
+        }
+        postcopy_discard_send_range(ms, one, discard_length);
+        current = one + discard_length;
     }
 
     return 0;
@@ -2674,17 +2901,16 @@ static int postcopy_each_ram_send_discard(MigrationState *ms)
     struct RAMBlock *block;
     int ret;
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
-        PostcopyDiscardState *pds =
-            postcopy_discard_send_init(ms, block->idstr);
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+        postcopy_discard_send_init(ms, block->idstr);
 
         /*
          * Postcopy sends chunks of bitmap over the wire, but it
          * just needs indexes at this point, avoids it having
          * target page specific code.
          */
-        ret = postcopy_send_discard_bm_ram(ms, pds, block);
-        postcopy_discard_send_finish(ms, pds);
+        ret = postcopy_send_discard_bm_ram(ms, block);
+        postcopy_discard_send_finish(ms);
         if (ret) {
             return ret;
         }
@@ -2694,7 +2920,7 @@ static int postcopy_each_ram_send_discard(MigrationState *ms)
 }
 
 /**
- * postcopy_chunk_hostpages_pass: canocalize bitmap in hostpages
+ * postcopy_chunk_hostpages_pass: canonicalize bitmap in hostpages
  *
  * Helper for postcopy_chunk_hostpages; it's called twice to
  * canonicalize the two bitmaps, that are similar, but one is
@@ -2704,18 +2930,12 @@ static int postcopy_each_ram_send_discard(MigrationState *ms)
  * clean, not a mix.  This function canonicalizes the bitmaps.
  *
  * @ms: current migration state
- * @unsent_pass: if true we need to canonicalize partially unsent host pages
- *               otherwise we need to canonicalize partially dirty host pages
  * @block: block that contains the page we want to canonicalize
- * @pds: state for postcopy
  */
-static void postcopy_chunk_hostpages_pass(MigrationState *ms, bool unsent_pass,
-                                          RAMBlock *block,
-                                          PostcopyDiscardState *pds)
+static void postcopy_chunk_hostpages_pass(MigrationState *ms, RAMBlock *block)
 {
     RAMState *rs = ram_state;
     unsigned long *bitmap = block->bmap;
-    unsigned long *unsentmap = block->unsentmap;
     unsigned int host_ratio = block->page_size / TARGET_PAGE_SIZE;
     unsigned long pages = block->used_length >> TARGET_PAGE_BITS;
     unsigned long run_start;
@@ -2725,83 +2945,34 @@ static void postcopy_chunk_hostpages_pass(MigrationState *ms, bool unsent_pass,
         return;
     }
 
-    if (unsent_pass) {
-        /* Find a sent page */
-        run_start = find_next_zero_bit(unsentmap, pages, 0);
-    } else {
-        /* Find a dirty page */
-        run_start = find_next_bit(bitmap, pages, 0);
-    }
+    /* Find a dirty page */
+    run_start = find_next_bit(bitmap, pages, 0);
 
     while (run_start < pages) {
-        bool do_fixup = false;
-        unsigned long fixup_start_addr;
-        unsigned long host_offset;
 
         /*
          * If the start of this run of pages is in the middle of a host
          * page, then we need to fixup this host page.
          */
-        host_offset = run_start % host_ratio;
-        if (host_offset) {
-            do_fixup = true;
-            run_start -= host_offset;
-            fixup_start_addr = run_start;
-            /* For the next pass */
-            run_start = run_start + host_ratio;
-        } else {
+        if (QEMU_IS_ALIGNED(run_start, host_ratio)) {
             /* Find the end of this run */
-            unsigned long run_end;
-            if (unsent_pass) {
-                run_end = find_next_bit(unsentmap, pages, run_start + 1);
-            } else {
-                run_end = find_next_zero_bit(bitmap, pages, run_start + 1);
-            }
+            run_start = find_next_zero_bit(bitmap, pages, run_start + 1);
             /*
              * If the end isn't at the start of a host page, then the
              * run doesn't finish at the end of a host page
              * and we need to discard.
              */
-            host_offset = run_end % host_ratio;
-            if (host_offset) {
-                do_fixup = true;
-                fixup_start_addr = run_end - host_offset;
-                /*
-                 * This host page has gone, the next loop iteration starts
-                 * from after the fixup
-                 */
-                run_start = fixup_start_addr + host_ratio;
-            } else {
-                /*
-                 * No discards on this iteration, next loop starts from
-                 * next sent/dirty page
-                 */
-                run_start = run_end + 1;
-            }
         }
 
-        if (do_fixup) {
+        if (!QEMU_IS_ALIGNED(run_start, host_ratio)) {
             unsigned long page;
-
-            /* Tell the destination to discard this page */
-            if (unsent_pass || !test_bit(fixup_start_addr, unsentmap)) {
-                /* For the unsent_pass we:
-                 *     discard partially sent pages
-                 * For the !unsent_pass (dirty) we:
-                 *     discard partially dirty pages that were sent
-                 *     (any partially sent pages were already discarded
-                 *     by the previous unsent_pass)
-                 */
-                postcopy_discard_send_range(ms, pds, fixup_start_addr,
-                                            host_ratio);
-            }
+            unsigned long fixup_start_addr = QEMU_ALIGN_DOWN(run_start,
+                                                             host_ratio);
+            run_start = QEMU_ALIGN_UP(run_start, host_ratio);
 
             /* Clean up the bitmap */
             for (page = fixup_start_addr;
                  page < fixup_start_addr + host_ratio; page++) {
-                /* All pages in this host page are now not sent */
-                set_bit(page, unsentmap);
-
                 /*
                  * Remark them as dirty, updating the count for any pages
                  * that weren't previously dirty.
@@ -2810,18 +2981,13 @@ static void postcopy_chunk_hostpages_pass(MigrationState *ms, bool unsent_pass,
             }
         }
 
-        if (unsent_pass) {
-            /* Find the next sent page for the next iteration */
-            run_start = find_next_zero_bit(unsentmap, pages, run_start);
-        } else {
-            /* Find the next dirty page for the next iteration */
-            run_start = find_next_bit(bitmap, pages, run_start);
-        }
+        /* Find the next dirty page for the next iteration */
+        run_start = find_next_bit(bitmap, pages, run_start);
     }
 }
 
 /**
- * postcopy_chuck_hostpages: discrad any partially sent host page
+ * postcopy_chunk_hostpages: discard any partially sent host page
  *
  * Utility for the outgoing postcopy code.
  *
@@ -2836,18 +3002,14 @@ static void postcopy_chunk_hostpages_pass(MigrationState *ms, bool unsent_pass,
  */
 static int postcopy_chunk_hostpages(MigrationState *ms, RAMBlock *block)
 {
-    PostcopyDiscardState *pds =
-        postcopy_discard_send_init(ms, block->idstr);
+    postcopy_discard_send_init(ms, block->idstr);
 
-    /* First pass: Discard all partially sent host pages */
-    postcopy_chunk_hostpages_pass(ms, true, block, pds);
     /*
-     * Second pass: Ensure that all partially dirty host pages are made
-     * fully dirty.
+     * Ensure that all partially dirty host pages are made fully dirty.
      */
-    postcopy_chunk_hostpages_pass(ms, false, block, pds);
+    postcopy_chunk_hostpages_pass(ms, block);
 
-    postcopy_discard_send_finish(ms, pds);
+    postcopy_discard_send_finish(ms);
     return 0;
 }
 
@@ -2882,20 +3044,7 @@ int ram_postcopy_send_discard_bitmap(MigrationState *ms)
     rs->last_sent_block = NULL;
     rs->last_page = 0;
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
-        unsigned long pages = block->used_length >> TARGET_PAGE_BITS;
-        unsigned long *bitmap = block->bmap;
-        unsigned long *unsentmap = block->unsentmap;
-
-        if (!unsentmap) {
-            /* We don't have a safe way to resize the sentmap, so
-             * if the bitmap was resized it will be NULL at this
-             * point.
-             */
-            error_report("migration ram resized during precopy phase");
-            rcu_read_unlock();
-            return -EINVAL;
-        }
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         /* Deal with TPS != HPS and huge pages */
         ret = postcopy_chunk_hostpages(ms, block);
         if (ret) {
@@ -2903,12 +3052,9 @@ int ram_postcopy_send_discard_bitmap(MigrationState *ms)
             return ret;
         }
 
-        /*
-         * Update the unsentmap to be unsentmap = unsentmap | dirty
-         */
-        bitmap_or(unsentmap, unsentmap, bitmap, pages);
 #ifdef DEBUG_POSTCOPY
-        ram_debug_dump_bitmap(unsentmap, true, pages);
+        ram_debug_dump_bitmap(block->bmap, true,
+                              block->used_length >> TARGET_PAGE_BITS);
 #endif
     }
     trace_ram_postcopy_send_discard_bitmap();
@@ -3033,9 +3179,9 @@ static int ram_state_init(RAMState **rsp)
     /*
      * Count the total number of pages used by ram blocks not including any
      * gaps due to alignment or unplugs.
+     * This must match with the initial values of dirty bitmap.
      */
     (*rsp)->migration_dirty_pages = ram_bytes_total() >> TARGET_PAGE_BITS;
-
     ram_state_reset(*rsp);
 
     return 0;
@@ -3043,19 +3189,39 @@ static int ram_state_init(RAMState **rsp)
 
 static void ram_list_init_bitmaps(void)
 {
+    MigrationState *ms = migrate_get_current();
     RAMBlock *block;
     unsigned long pages;
+    uint8_t shift;
 
     /* Skip setting bitmap if there is no RAM */
     if (ram_bytes_total()) {
-        RAMBLOCK_FOREACH_MIGRATABLE(block) {
+        shift = ms->clear_bitmap_shift;
+        if (shift > CLEAR_BITMAP_SHIFT_MAX) {
+            error_report("clear_bitmap_shift (%u) too big, using "
+                         "max value (%u)", shift, CLEAR_BITMAP_SHIFT_MAX);
+            shift = CLEAR_BITMAP_SHIFT_MAX;
+        } else if (shift < CLEAR_BITMAP_SHIFT_MIN) {
+            error_report("clear_bitmap_shift (%u) too small, using "
+                         "min value (%u)", shift, CLEAR_BITMAP_SHIFT_MIN);
+            shift = CLEAR_BITMAP_SHIFT_MIN;
+        }
+
+        RAMBLOCK_FOREACH_NOT_IGNORED(block) {
             pages = block->max_length >> TARGET_PAGE_BITS;
+            /*
+             * The initial dirty bitmap for migration must be set with all
+             * ones to make sure we'll migrate every guest RAM page to
+             * destination.
+             * Here we set RAMBlock.bmap all to 1 because when rebegin a
+             * new migration after a failed migration, ram_list.
+             * dirty_memory[DIRTY_MEMORY_MIGRATION] don't include the whole
+             * guest memory.
+             */
             block->bmap = bitmap_new(pages);
             bitmap_set(block->bmap, 0, pages);
-            if (migrate_postcopy_ram()) {
-                block->unsentmap = bitmap_new(pages);
-                bitmap_set(block->unsentmap, 0, pages);
-            }
+            block->clear_bmap_shift = shift;
+            block->clear_bmap = bitmap_new(clear_bmap_size(pages, shift));
         }
     }
 }
@@ -3069,7 +3235,7 @@ static void ram_init_bitmaps(RAMState *rs)
 
     ram_list_init_bitmaps();
     memory_global_dirty_log_start();
-    migration_bitmap_sync(rs);
+    migration_bitmap_sync_precopy(rs);
 
     rcu_read_unlock();
     qemu_mutex_unlock_ramlist();
@@ -3103,7 +3269,7 @@ static void ram_state_resume_prepare(RAMState *rs, QEMUFile *out)
      * about dirty page logging as well.
      */
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         pages += bitmap_count_one(block->bmap,
                                   block->used_length >> TARGET_PAGE_BITS);
     }
@@ -3125,6 +3291,53 @@ static void ram_state_resume_prepare(RAMState *rs, QEMUFile *out)
     rs->f = out;
 
     trace_ram_state_resume_prepare(pages);
+}
+
+/*
+ * This function clears bits of the free pages reported by the caller from the
+ * migration dirty bitmap. @addr is the host address corresponding to the
+ * start of the continuous guest free pages, and @len is the total bytes of
+ * those pages.
+ */
+void qemu_guest_free_page_hint(void *addr, size_t len)
+{
+    RAMBlock *block;
+    ram_addr_t offset;
+    size_t used_len, start, npages;
+    MigrationState *s = migrate_get_current();
+
+    /* This function is currently expected to be used during live migration */
+    if (!migration_is_setup_or_active(s->state)) {
+        return;
+    }
+
+    for (; len > 0; len -= used_len, addr += used_len) {
+        block = qemu_ram_block_from_host(addr, false, &offset);
+        if (unlikely(!block || offset >= block->used_length)) {
+            /*
+             * The implementation might not support RAMBlock resize during
+             * live migration, but it could happen in theory with future
+             * updates. So we add a check here to capture that case.
+             */
+            error_report_once("%s unexpected error", __func__);
+            return;
+        }
+
+        if (len <= block->used_length - offset) {
+            used_len = len;
+        } else {
+            used_len = block->used_length - offset;
+        }
+
+        start = offset >> TARGET_PAGE_BITS;
+        npages = used_len >> TARGET_PAGE_BITS;
+
+        qemu_mutex_lock(&ram_state->bitmap_mutex);
+        ram_state->migration_dirty_pages -=
+                      bitmap_count_one_with_offset(block->bmap, start, npages);
+        bitmap_clear(block->bmap, start, npages);
+        qemu_mutex_unlock(&ram_state->bitmap_mutex);
+    }
 }
 
 /*
@@ -3162,7 +3375,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
 
     rcu_read_lock();
 
-    qemu_put_be64(f, ram_bytes_total() | RAM_SAVE_FLAG_MEM_SIZE);
+    qemu_put_be64(f, ram_bytes_total_common(true) | RAM_SAVE_FLAG_MEM_SIZE);
 
     RAMBLOCK_FOREACH_MIGRATABLE(block) {
         qemu_put_byte(f, strlen(block->idstr));
@@ -3171,6 +3384,9 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
         if (migrate_postcopy_ram() && block->page_size != qemu_host_page_size) {
             qemu_put_be64(f, block->page_size);
         }
+        if (migrate_ignore_shared()) {
+            qemu_put_be64(f, block->mr->addr);
+        }
     }
 
     rcu_read_unlock();
@@ -3178,7 +3394,7 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     ram_control_before_iterate(f, RAM_CONTROL_SETUP);
     ram_control_after_iterate(f, RAM_CONTROL_SETUP);
 
-    multifd_send_sync_main();
+    multifd_send_sync_main(*rsp);
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
     qemu_fflush(f);
 
@@ -3245,7 +3461,7 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
 
         /* we want to check in the 1st loop, just in case it was the 1st time
            and we had to sync the dirty bitmap.
-           qemu_get_clock_ns() is a bit expensive, so we only check each some
+           qemu_clock_get_ns() is a bit expensive, so we only check each some
            iterations
         */
         if ((i & 63) == 0) {
@@ -3265,8 +3481,8 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
      */
     ram_control_after_iterate(f, RAM_CONTROL_ROUND);
 
-    multifd_send_sync_main();
 out:
+    multifd_send_sync_main(rs);
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
     qemu_fflush(f);
     ram_counters.transferred += 8;
@@ -3298,7 +3514,7 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     rcu_read_lock();
 
     if (!migration_in_postcopy()) {
-        migration_bitmap_sync(rs);
+        migration_bitmap_sync_precopy(rs);
     }
 
     ram_control_before_iterate(f, RAM_CONTROL_FINISH);
@@ -3325,7 +3541,7 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
 
     rcu_read_unlock();
 
-    multifd_send_sync_main();
+    multifd_send_sync_main(rs);
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
     qemu_fflush(f);
 
@@ -3347,7 +3563,7 @@ static void ram_save_pending(QEMUFile *f, void *opaque, uint64_t max_size,
         remaining_size < max_size) {
         qemu_mutex_lock_iothread();
         rcu_read_lock();
-        migration_bitmap_sync(rs);
+        migration_bitmap_sync_precopy(rs);
         rcu_read_unlock();
         qemu_mutex_unlock_iothread();
         remaining_size = rs->migration_dirty_pages * TARGET_PAGE_SIZE;
@@ -3429,7 +3645,7 @@ static inline RAMBlock *ram_block_from_stream(QEMUFile *f, int flags)
         return NULL;
     }
 
-    if (!qemu_ram_is_migratable(block)) {
+    if (ramblock_is_ignored(block)) {
         error_report("block %s should not be migrated !", id);
         return NULL;
     }
@@ -3684,7 +3900,7 @@ int colo_init_ram_cache(void)
     RAMBlock *block;
 
     rcu_read_lock();
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         block->colo_cache = qemu_anon_ram_alloc(block->used_length,
                                                 NULL,
                                                 false);
@@ -3705,7 +3921,7 @@ int colo_init_ram_cache(void)
     if (ram_bytes_total()) {
         RAMBlock *block;
 
-        RAMBLOCK_FOREACH_MIGRATABLE(block) {
+        RAMBLOCK_FOREACH_NOT_IGNORED(block) {
             unsigned long pages = block->max_length >> TARGET_PAGE_BITS;
 
             block->bmap = bitmap_new(pages);
@@ -3714,13 +3930,14 @@ int colo_init_ram_cache(void)
     }
     ram_state = g_new0(RAMState, 1);
     ram_state->migration_dirty_pages = 0;
+    qemu_mutex_init(&ram_state->bitmap_mutex);
     memory_global_dirty_log_start();
 
     return 0;
 
 out_locked:
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         if (block->colo_cache) {
             qemu_anon_ram_free(block->colo_cache, block->used_length);
             block->colo_cache = NULL;
@@ -3737,14 +3954,14 @@ void colo_release_ram_cache(void)
     RAMBlock *block;
 
     memory_global_dirty_log_stop();
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         g_free(block->bmap);
         block->bmap = NULL;
     }
 
     rcu_read_lock();
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         if (block->colo_cache) {
             qemu_anon_ram_free(block->colo_cache, block->used_length);
             block->colo_cache = NULL;
@@ -3752,6 +3969,7 @@ void colo_release_ram_cache(void)
     }
 
     rcu_read_unlock();
+    qemu_mutex_destroy(&ram_state->bitmap_mutex);
     g_free(ram_state);
     ram_state = NULL;
 }
@@ -3780,7 +3998,7 @@ static int ram_load_cleanup(void *opaque)
 {
     RAMBlock *rb;
 
-    RAMBLOCK_FOREACH_MIGRATABLE(rb) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
         if (ramblock_is_pmem(rb)) {
             pmem_persist(rb->host, rb->used_length);
         }
@@ -3789,7 +4007,7 @@ static int ram_load_cleanup(void *opaque)
     xbzrle_load_cleanup();
     compress_threads_load_cleanup();
 
-    RAMBLOCK_FOREACH_MIGRATABLE(rb) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
         g_free(rb->receivedmap);
         rb->receivedmap = NULL;
     }
@@ -3989,8 +4207,8 @@ static void colo_flush_ram_cache(void)
 
     memory_global_dirty_log_sync();
     rcu_read_lock();
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
-        migration_bitmap_sync_range(ram_state, block, 0, block->used_length);
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+        ramblock_sync_dirty_bitmap(ram_state, block);
     }
     rcu_read_unlock();
 
@@ -4016,40 +4234,26 @@ static void colo_flush_ram_cache(void)
     trace_colo_flush_ram_cache_end();
 }
 
-static int ram_load(QEMUFile *f, void *opaque, int version_id)
+/**
+ * ram_load_precopy: load pages in precopy case
+ *
+ * Returns 0 for success or -errno in case of error
+ *
+ * Called in precopy mode by ram_load().
+ * rcu_read_lock is taken prior to this being called.
+ *
+ * @f: QEMUFile where to send the data
+ */
+static int ram_load_precopy(QEMUFile *f)
 {
-    int flags = 0, ret = 0, invalid_flags = 0;
-    static uint64_t seq_iter;
-    int len = 0;
-    /*
-     * If system is running in postcopy mode, page inserts to host memory must
-     * be atomic
-     */
-    bool postcopy_running = postcopy_is_running();
+    int flags = 0, ret = 0, invalid_flags = 0, len = 0;
     /* ADVISE is earlier, it shows the source has the postcopy capability on */
     bool postcopy_advised = postcopy_is_advised();
-
-    seq_iter++;
-
-    if (version_id != 4) {
-        ret = -EINVAL;
-    }
-
     if (!migrate_use_compression()) {
         invalid_flags |= RAM_SAVE_FLAG_COMPRESS_PAGE;
     }
-    /* This RCU critical section can be very long running.
-     * When RCU reclaims in the code start to become numerous,
-     * it will be necessary to reduce the granularity of this
-     * critical section.
-     */
-    rcu_read_lock();
 
-    if (postcopy_running) {
-        ret = ram_load_postcopy(f);
-    }
-
-    while (!postcopy_running && !ret && !(flags & RAM_SAVE_FLAG_EOS)) {
+    while (!ret && !(flags & RAM_SAVE_FLAG_EOS)) {
         ram_addr_t addr, total_ram_bytes;
         void *host = NULL;
         uint8_t ch;
@@ -4132,6 +4336,17 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
                             ret = -EINVAL;
                         }
                     }
+                    if (migrate_ignore_shared()) {
+                        hwaddr addr = qemu_get_be64(f);
+                        if (ramblock_is_ignored(block) &&
+                            block->mr->addr != addr) {
+                            error_report("Mismatched GPAs for block %s "
+                                         "%" PRId64 "!= %" PRId64,
+                                         id, (uint64_t)addr,
+                                         (uint64_t)block->mr->addr);
+                            ret = -EINVAL;
+                        }
+                    }
                     ram_control_load_hook(f, RAM_CONTROL_BLOCK_REG,
                                           block->idstr);
                 } else {
@@ -4189,6 +4404,39 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
         }
     }
 
+    return ret;
+}
+
+static int ram_load(QEMUFile *f, void *opaque, int version_id)
+{
+    int ret = 0;
+    static uint64_t seq_iter;
+    /*
+     * If system is running in postcopy mode, page inserts to host memory must
+     * be atomic
+     */
+    bool postcopy_running = postcopy_is_running();
+
+    seq_iter++;
+
+    if (version_id != 4) {
+        return -EINVAL;
+    }
+
+    /*
+     * This RCU critical section can be very long running.
+     * When RCU reclaims in the code start to become numerous,
+     * it will be necessary to reduce the granularity of this
+     * critical section.
+     */
+    rcu_read_lock();
+
+    if (postcopy_running) {
+        ret = ram_load_postcopy(f);
+    } else {
+        ret = ram_load_precopy(f);
+    }
+
     ret |= wait_for_decompress_done();
     rcu_read_unlock();
     trace_ram_load_complete(ret, seq_iter);
@@ -4202,7 +4450,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
 static bool ram_has_postcopy(void *opaque)
 {
     RAMBlock *rb;
-    RAMBLOCK_FOREACH_MIGRATABLE(rb) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
         if (ramblock_is_pmem(rb)) {
             info_report("Block: %s, host: %p is a nvdimm memory, postcopy"
                          "is not supported now!", rb->idstr, rb->host);
@@ -4222,7 +4470,7 @@ static int ram_dirty_bitmap_sync_all(MigrationState *s, RAMState *rs)
 
     trace_ram_dirty_bitmap_sync_start();
 
-    RAMBLOCK_FOREACH_MIGRATABLE(block) {
+    RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         qemu_savevm_send_recv_bitmap(file, block->idstr);
         trace_ram_dirty_bitmap_request(block->idstr);
         ramblock_count++;
@@ -4363,5 +4611,5 @@ static SaveVMHandlers savevm_ram_handlers = {
 void ram_mig_init(void)
 {
     qemu_mutex_init(&XBZRLE.lock);
-    register_savevm_live(NULL, "ram", 0, 4, &savevm_ram_handlers, &ram_state);
+    register_savevm_live("ram", 0, 4, &savevm_ram_handlers, &ram_state);
 }
