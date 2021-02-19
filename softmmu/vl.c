@@ -37,6 +37,16 @@
 #include "sysemu/seccomp.h"
 #include "sysemu/tcg.h"
 
+#ifdef CONFIG_TCG_PLUGIN
+extern void tcg_plugin_load(const char *);
+extern void tcg_plugin_initialize_all(void);
+extern void tcg_plugin_set_filename(const char *filename);
+#else
+#define tcg_plugin_load(a) ((void)0)
+#define tcg_plugin_initialize_all() ((void)0)
+#define tcg_plugin_set_filename(f) ((void)0)
+#endif
+
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
 #include "sysemu/accel.h"
@@ -2833,6 +2843,7 @@ void qemu_init(int argc, char **argv, char **envp)
     const char *qtest_chrdev = NULL;
     const char *qtest_log = NULL;
     const char *incoming = NULL;
+    const char *plugin_filename = NULL;
     bool userconfig = true;
     bool nographic = false;
     int display_remote = 0;
@@ -3603,6 +3614,18 @@ void qemu_init(int argc, char **argv, char **envp)
                 warn_report("The -tb-size option is deprecated, use -accel tcg,tb-size instead");
                 object_register_sugar_prop(ACCEL_CLASS_NAME("tcg"), "tb-size", optarg);
                 break;
+            case QEMU_OPTION_count_ifetch:
+                count_ifetch |= 0x1;
+                break;
+            case QEMU_OPTION_clock_ifetch:
+                count_ifetch |= 0x2;
+                clock_ifetch = convert_string_to_frequency(optarg);
+                break;
+#ifdef CONFIG_TCG_PLUGIN
+            case QEMU_OPTION_tcg_plugin:
+                plugin_filename = optarg;
+                break;
+#endif /* CONFIG_TCG_PLUGIN */
             case QEMU_OPTION_icount:
                 icount_opts = qemu_opts_parse_noisily(qemu_find_opts("icount"),
                                                       optarg, true);
@@ -3980,6 +4003,9 @@ void qemu_init(int argc, char **argv, char **envp)
         object_register_sugar_prop("memory-backend", "prealloc-threads", val);
         g_free(val);
         object_register_sugar_prop("memory-backend", "prealloc", "on");
+    plugin_filename = plugin_filename ?: getenv("TCG_PLUGIN");
+    if (plugin_filename) {
+        tcg_plugin_load(plugin_filename);
     }
 
     /*
@@ -4229,6 +4255,12 @@ void qemu_init(int argc, char **argv, char **envp)
         semihosting_arg_fallback(kernel_filename, kernel_cmdline);
     }
 
+    if (semihosting_enabled() && semihosting_get_arg(0) != NULL) {
+        tcg_plugin_set_filename(semihosting_get_arg(0));
+    }
+
+    os_set_line_buffering();
+
     /* spice needs the timers to be initialized by this point */
     qemu_spice_init();
 
@@ -4458,6 +4490,9 @@ void qemu_init(int argc, char **argv, char **envp)
         dump_vmstate_json_to_file(vmstate_dump_file);
         exit(0);
     }
+
+    initialize_ifetch();
+    tcg_plugin_initialize_all();
 
     if (incoming) {
         Error *local_err = NULL;

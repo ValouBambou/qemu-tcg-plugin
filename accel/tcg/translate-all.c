@@ -59,6 +59,8 @@
 #include "sysemu/cpus.h"
 #include "sysemu/tcg.h"
 
+#include "tcg/tcg-plugin.h"
+
 /* #define DEBUG_TB_INVALIDATE */
 /* #define DEBUG_TB_FLUSH */
 /* make various TB consistency checks */
@@ -235,6 +237,43 @@ static void page_table_config_init(void)
     assert(v_l1_shift % V_L2_BITS == 0);
     assert(v_l2_levels >= 0);
 }
+
+
+/* log file for linux perf symbol map */
+static FILE *tb_perfmap = NULL;
+
+void tb_enable_perfmap(void)
+{
+    if (tb_perfmap) { return; }
+
+    gchar *map_file = g_strdup_printf("/tmp/perf-%d.map", getpid());
+    tb_perfmap = fopen(map_file, "w");
+    if (!tb_perfmap) {
+        fprintf(stderr, "error: could not open linux perf symbol map file: "
+                        "'%s'\n", map_file);
+        exit(1);
+    }
+    g_free(map_file);
+}
+
+static void tb_write_perfmap(tcg_insn_unit *start, int size,
+                             target_ulong pc)
+{
+    if (tb_perfmap) {
+        const char *symbol, *file;
+
+        if (!lookup_symbol2(pc, &symbol, &file)) {
+            file = symbol = "<unknown>";
+        }
+
+        fprintf(
+            tb_perfmap,
+            "%" PRIxPTR " %x qemu-" TARGET_FMT_lx "-%s\n",
+                (uintptr_t) start, size, pc, symbol);
+        fflush(tb_perfmap);
+    }
+}
+
 
 void cpu_gen_init(void)
 {
@@ -1715,7 +1754,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tcg_func_start(tcg_ctx);
 
     tcg_ctx->cpu = env_cpu(env);
+    tcg_plugin_before_gen_tb(tb);
     gen_intermediate_code(cpu, tb, max_insns);
+    tcg_plugin_after_gen_tb(tb);
     tcg_ctx->cpu = NULL;
 
     trace_translate_block(tb, tb->pc, tb->tc.ptr);
@@ -1784,6 +1825,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     atomic_set(&prof->code_out_len, prof->code_out_len + gen_code_size);
     atomic_set(&prof->search_out_len, prof->search_out_len + search_size);
 #endif
+
+    tb_write_perfmap(gen_code_buf, gen_code_size, tb->pc);
 
 #ifdef DEBUG_DISAS
     if (qemu_loglevel_mask(CPU_LOG_TB_OUT_ASM) &&

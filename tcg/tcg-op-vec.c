@@ -22,6 +22,7 @@
 #include "tcg/tcg.h"
 #include "tcg/tcg-op.h"
 #include "tcg/tcg-mo.h"
+#include "tcg/tcg-plugin.h"
 
 /* Reduce the number of ifdefs below.  This assumes that all uses of
    TCGV_HIGH and TCGV_LOW are properly protected by a conditional that
@@ -145,6 +146,8 @@ void vec_gen_2(TCGOpcode opc, TCGType type, unsigned vece, TCGArg r, TCGArg a)
     TCGOP_VECE(op) = vece;
     op->args[0] = r;
     op->args[1] = a;
+
+    tcg_plugin_after_gen_opc(op, 2);
 }
 
 void vec_gen_3(TCGOpcode opc, TCGType type, unsigned vece,
@@ -156,6 +159,8 @@ void vec_gen_3(TCGOpcode opc, TCGType type, unsigned vece,
     op->args[0] = r;
     op->args[1] = a;
     op->args[2] = b;
+
+    tcg_plugin_after_gen_opc(op, 3);
 }
 
 void vec_gen_4(TCGOpcode opc, TCGType type, unsigned vece,
@@ -168,6 +173,8 @@ void vec_gen_4(TCGOpcode opc, TCGType type, unsigned vece,
     op->args[1] = a;
     op->args[2] = b;
     op->args[3] = c;
+
+    tcg_plugin_after_gen_opc(op, 4);
 }
 
 static void vec_gen_6(TCGOpcode opc, TCGType type, unsigned vece, TCGArg r,

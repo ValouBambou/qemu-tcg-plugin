@@ -392,6 +392,9 @@ whpx="no"
 rdma=""
 pvrdma=""
 gprof="no"
+syscall_fwd_compat="no"
+tcg_plugin="no"
+tcg_plugin_cpp="no"
 debug_tcg="no"
 debug="no"
 sanitizers="no"
@@ -1133,6 +1136,18 @@ for opt do
   --block-drv-rw-whitelist=*|--block-drv-whitelist=*) block_drv_rw_whitelist=$(echo "$optarg" | sed -e 's/,/ /g')
   ;;
   --block-drv-ro-whitelist=*) block_drv_ro_whitelist=$(echo "$optarg" | sed -e 's/,/ /g')
+  ;;
+  --enable-syscall-fwd-compat) syscall_fwd_compat="yes"
+  ;;
+  --disable-syscall-fwd-compat) syscall_fwd_compat="no"
+  ;;
+  --enable-tcg-plugin) tcg_plugin="yes";
+  ;;
+  --enable-tcg-plugin-cpp) tcg_plugin="yes"; tcg_plugin_cpp="yes"
+  ;;
+  --disable-tcg-plugin) tcg_plugin="no"; tcg_plugin_cpp="no"
+  ;;
+  --disable-tcg-plugin-cpp) tcg_plugin_cpp="no"
   ;;
   --enable-debug-tcg) debug_tcg="yes"
   ;;
@@ -1895,6 +1910,12 @@ disabled with --disable-FEATURE, default is enabled if available:
   libpmem         libpmem support
   xkbcommon       xkbcommon support
 
+Optional stm features, enabled with --enable-FEATURE and
+disabled with --disable-FEATURE, default is disabled:
+  syscall-fwd-compat     enable syscall forward compatibility in linux-user mode
+  tcg-plugin             enable TCG plugin support
+  tcg-plugin-cpp         enable TCG CPP plugin support
+
 NOTE: The object files are built at the place where configure is launched
 EOF
 exit 0
@@ -2086,6 +2107,9 @@ fi
 
 # Static linking is not possible with modules or PIE
 if test "$static" = "yes" ; then
+  if test "$tcg_plugin" = "yes" ; then
+    error_exit "static and tcg plugins are mutually incompatible"
+  fi
   if test "$modules" = "yes" ; then
     error_exit "static and modules are mutually incompatible"
   fi
@@ -6590,6 +6614,9 @@ echo "alt path mod load $module_upgrades"
 echo "host CPU          $cpu"
 echo "host big endian   $bigendian"
 echo "target list       $target_list"
+echo "syscall fwd compat $syscall_fwd_compat"
+echo "tcg plugin support $tcg_plugin"
+echo "tcg plugin cpp support $tcg_plugin_cpp"
 echo "gprof enabled     $gprof"
 echo "sparse enabled    $sparse"
 echo "strip binaries    $strip_opt"
@@ -6795,11 +6822,30 @@ echo "GIT_UPDATE=$git_update" >> $config_host_mak
 
 echo "ARCH=$ARCH" >> $config_host_mak
 
+if test "$syscall_fwd_compat" = "yes" ; then
+  echo "CONFIG_SYSCALL_FWD_COMPAT=y" >> $config_host_mak
+fi
+
+if test "$tcg_plugin" = "yes" ; then
+  echo "CONFIG_TCG_PLUGIN=y" >> $config_host_mak
+  LIBS="-ldl $LIBS"
+  QEMU_LDFLAGS="-rdynamic $QEMU_LDFLAGS"
+fi
+
+if test "$tcg_plugin_cpp" = "yes" ; then
+  if test "$capstone" = no ; then
+    error_exit "C++ TCG plugins require capstone, but capstone support was disabled."
+  fi
+  ## TODO: probe for/build libelfin required by cpp plugins
+  echo "CONFIG_TCG_PLUGIN_CPP=y" >> $config_host_mak
+fi
+
 if test "$default_devices" = "yes" ; then
   echo "CONFIG_MINIKCONF_MODE=--defconfig" >> $config_host_mak
 else
   echo "CONFIG_MINIKCONF_MODE=--allnoconfig" >> $config_host_mak
 fi
+
 if test "$debug_tcg" = "yes" ; then
   echo "CONFIG_DEBUG_TCG=y" >> $config_host_mak
 fi

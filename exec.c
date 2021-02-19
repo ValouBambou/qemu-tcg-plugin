@@ -75,6 +75,8 @@
 #include "qemu/mmap-alloc.h"
 #endif
 
+#include "tcg/tcg-plugin.h"
+
 #include "monitor/monitor.h"
 
 //#define DEBUG_SUBPAGE
@@ -830,6 +832,78 @@ const VMStateDescription vmstate_cpu_common = {
 
 #endif
 
+/* Count the number of fetched instructions.  */
+int count_ifetch = 0;
+
+static FILE *output_ifetch;
+void initialize_ifetch(void)
+{
+    if (!(count_ifetch & 0x1))
+        return;
+    output_ifetch = fdopen(dup(fileno(stderr)), "a");
+    if (!output_ifetch) output_ifetch = stderr;
+}
+
+void show_all_ifetch_counters(void)
+{
+    CPUState *cpu;
+
+    /* Print the result only if the -count-ifetch option was passed to
+     * the command-line.  */
+    if (!(count_ifetch & 0x1))
+        return;
+
+    CPU_FOREACH(cpu) {
+        fprintf(output_ifetch,
+                "qemu: number of fetched instructions on CPU #%d = %" PRIu64 "\n",
+                cpu->cpu_index, cpu->ifetch_counter);
+    }
+}
+
+/* Number of fetched instructions per second.  */
+uint64_t clock_ifetch = 0;
+
+uint64_t convert_string_to_frequency(const char *string)
+{
+    uint64_t factor;
+    char *not_a_number;
+    const char *cause;
+    unsigned long long int frequency;
+
+    frequency = strtoull(string, &not_a_number, 10);
+    if (!frequency) {
+        cause = "there's no digits in the initial part";
+        goto error;
+    }
+
+    if (not_a_number[0] == '\0' || !strcasecmp(not_a_number, "Hz")) {
+        factor = 1;
+    } else if (!strcasecmp(not_a_number, "KHz")) {
+        factor = 1000;
+    } else if (!strcasecmp(not_a_number, "MHz")) {
+        factor = 1000*1000;
+    } else if (!strcasecmp(not_a_number, "GHz")) {
+        factor = 1000*1000*1000;
+    } else {
+        cause = "the frequency unit is unknown";
+        goto error;
+    }
+
+    if (frequency >= UINT64_MAX / factor) {
+        fprintf(stderr, "qemu: frequency value \"%s\" overflows a "
+                "64-bit unsigned integer, limiting it to %" PRIu64 ".\n",
+                string, UINT64_MAX);
+        frequency = UINT64_MAX;
+        factor = 1;
+    }
+
+    return frequency * factor;
+
+error:
+    fprintf(stderr, "qemu: frequency value \"%s\" is invalid, %s.\n", string, cause);
+    exit(1);
+}
+
 CPUState *qemu_get_cpu(int index)
 {
     CPUState *cpu;
@@ -1217,6 +1291,9 @@ void cpu_abort(CPUState *cpu, const char *fmt, ...)
 {
     va_list ap;
     va_list ap2;
+
+    show_all_ifetch_counters();
+    tcg_plugin_cpus_stopped();
 
     va_start(ap, fmt);
     va_copy(ap2, ap);

@@ -428,6 +428,15 @@ typedef enum {
     TCG_COND_GTU    = 8 | 4 | 0 | 1,
 } TCGCond;
 
+typedef struct TCGHelperInfo {
+    void *func;
+    const char *name;
+    unsigned flags;
+    unsigned sizemask;
+} TCGHelperInfo;
+
+void tcg_define_helper(const TCGHelperInfo *helper);
+
 /* Invert the sense of the comparison.  */
 static inline TCGCond tcg_invert_cond(TCGCond c)
 {
@@ -1028,6 +1037,9 @@ TCGOp *tcg_op_insert_before(TCGContext *s, TCGOp *op, TCGOpcode opc);
 TCGOp *tcg_op_insert_after(TCGContext *s, TCGOp *op, TCGOpcode opc);
 
 void tcg_optimize(TCGContext *s);
+
+/* only used for debugging purposes */
+void tcg_dump_op(TCGContext *s, const TCGOp *const op, FILE *dst);
 
 TCGv_i32 tcg_const_i32(int32_t val);
 TCGv_i64 tcg_const_i64(int64_t val);

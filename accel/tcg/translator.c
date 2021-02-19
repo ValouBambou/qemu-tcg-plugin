@@ -12,6 +12,7 @@
 #include "cpu.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-op.h"
+#include "tcg/tcg-plugin.h"
 #include "exec/exec-all.h"
 #include "exec/gen-icount.h"
 #include "exec/log.h"
@@ -58,9 +59,11 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
     tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
     plugin_enabled = plugin_gen_tb_start(cpu, tb);
+    tcg_plugin_before_decode_first_instr(tb);
 
     while (true) {
         db->num_insns++;
+        tcg_plugin_before_decode_instr(db->pc_next);
         ops->insn_start(db, cpu);
         tcg_debug_assert(db->is_jmp == DISAS_NEXT);  /* no early exit */
 
@@ -122,6 +125,8 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
             break;
         }
     }
+
+    tcg_plugin_after_decode_last_instr(tb);
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);

@@ -20,9 +20,50 @@
 #include "trace.h"
 #include "exec/log.h"
 #include "qemu.h"
+#include "tcg/tcg-plugin.h"
 
 static pthread_mutex_t mmap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static __thread int mmap_lock_count;
+
+/* keep track of files mapped */
+struct mapinfo {
+    const char *filename;
+    uint64_t addr;
+    size_t length;
+    struct mapinfo *next;
+};
+struct mapinfo *mapinfos = NULL;
+
+bool get_mapped_file(uint64_t addr, const char** name, uint64_t* base_addr)
+{
+    struct mapinfo *it;
+    for (it = mapinfos; it != NULL; it = it->next)
+    {
+        if (addr >= it->addr && addr < it->addr + it->length)
+        {
+            *name = it->filename;
+            *base_addr = it->addr;
+        }
+    }
+    return NULL;
+}
+
+void add_mapinfo(const char* filename, uint64_t addr, size_t length)
+{
+    struct mapinfo *info = g_new(struct mapinfo, 1);
+    info->filename = g_strdup(filename);
+    info->addr = addr;
+    info->length = length;
+    info->next = mapinfos;
+    mapinfos = info;
+    /*
+    fprintf(stderr, "New mapping %s at 0x%" PRIx64 ", length %lu, end 0x%" PRIx64 "\n",
+            mapinfos->filename,
+            mapinfos->addr,
+            mapinfos->length,
+            addr + length - 1);
+    */
+}
 
 void mmap_lock(void)
 {

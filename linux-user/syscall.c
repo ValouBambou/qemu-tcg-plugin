@@ -58,6 +58,8 @@
 #include <linux/icmpv6.h>
 #include <linux/errqueue.h>
 #include <linux/random.h>
+#include "qemu-common.h"
+//For clock and count_ifetch
 #ifdef CONFIG_TIMERFD
 #include <sys/timerfd.h>
 #endif
@@ -122,6 +124,9 @@
 #include "qapi/error.h"
 #include "fd-trans.h"
 #include "tcg/tcg.h"
+
+/* Enable syscall forward compatibility if requested. */
+#include "syscall_fwd_compat.h"
 
 #ifndef CLONE_IO
 #define CLONE_IO                0x80000000      /* Clone io context */
@@ -8246,7 +8251,29 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 tmsp = lock_user(VERIFY_WRITE, arg1, sizeof(struct target_tms), 0);
                 if (!tmsp)
                     return -TARGET_EFAULT;
-                tmsp->tms_utime = tswapal(host_to_target_clock_t(tms.tms_utime));
+                if (clock_ifetch) {
+                    uint64_t count;
+                    abi_long utime_ticks;
+                    assert(count_ifetch);
+                    /* The following computation may look a little bit
+                     * "magic" but it is actually coherent in terms of
+                     * unit:
+                     *
+                     *     ifetch_counter       -> #instructions            (i)
+                     *     clock_ifetch         -> #instructions / #seconds (i/s)
+                     *     sysconf(_SC_CLK_TCK) -> #ticks / #seconds        (t/s)
+                     *
+                     * As a consequence the result is in #ticks since:
+                     *
+                     *     i / (i/s) * t/s      -> t
+                     */
+                    count = env_cpu((CPUArchState*)cpu_env)->ifetch_counter;
+                    utime_ticks = (count / clock_ifetch) * sysconf(_SC_CLK_TCK);
+                    tmsp->tms_utime = tswapal(utime_ticks);
+                }
+                else {
+                    tmsp->tms_utime = tswapal(host_to_target_clock_t(tms.tms_utime));
+                }
                 tmsp->tms_stime = tswapal(host_to_target_clock_t(tms.tms_stime));
                 tmsp->tms_cutime = tswapal(host_to_target_clock_t(tms.tms_cutime));
                 tmsp->tms_cstime = tswapal(host_to_target_clock_t(tms.tms_cstime));
@@ -11637,6 +11664,26 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         struct timespec ts;
         ret = get_errno(clock_gettime(arg1, &ts));
         if (!is_error(ret)) {
+            if (clock_ifetch) {
+                uint64_t count;
+                uint64_t secs;
+                assert(count_ifetch);
+                /* The following computation may look a little bit
+                 * "magic" but it is actually coherent in terms of
+                 * unit:
+                 *
+                 *     ifetch_counter       -> #instructions            (i)
+                 *     clock_ifetch         -> #instructions / #seconds (i/s)
+                 *
+                 * As a consequence the result is in #seconds since:
+                 *
+                 *     i / (i/s)            -> s
+                 */
+                count = env_cpu((CPUArchState*)cpu_env)->ifetch_counter;
+                secs = count / clock_ifetch;
+                ts.tv_sec  = secs;
+                ts.tv_nsec = ((count - secs * clock_ifetch) * 1000000000) / clock_ifetch;
+            }
             ret = host_to_target_timespec(arg2, &ts);
         }
         return ret;
@@ -12402,7 +12449,8 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 
     default:
-        qemu_log_mask(LOG_UNIMP, "Unsupported syscall: %d\n", num);
+        qemu_log_mask(LOG_UNIMP, "qemu: Unsupported syscall: %d (%s)\n", num,
+                      get_syscall_name(num) ?: "unknown");
         return -TARGET_ENOSYS;
     }
     return ret;

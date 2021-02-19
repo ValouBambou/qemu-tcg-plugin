@@ -38,6 +38,7 @@
 #include "cpu.h"
 #include "exec/exec-all.h"
 #include "tcg/tcg.h"
+#include "tcg/tcg-plugin.h"
 #include "qemu/timer.h"
 #include "qemu/envlist.h"
 #include "qemu/guest-random.h"
@@ -318,6 +319,24 @@ static void handle_arg_uname(const char *arg)
     qemu_uname_release = strdup(arg);
 }
 
+static void handle_arg_count_ifetch(const char *arg)
+{
+    count_ifetch |= 0x1;
+}
+
+static void handle_arg_clock_ifetch(const char *arg)
+{
+    count_ifetch |= 0x2;
+    clock_ifetch = convert_string_to_frequency(arg);
+}
+
+#ifdef CONFIG_TCG_PLUGIN
+static void handle_arg_tcg_plugin(const char *arg)
+{
+    tcg_plugin_load(arg);
+}
+#endif /* CONFIG_TCG_PLUGIN */
+
 static void handle_arg_cpu(const char *arg)
 {
     cpu_model = strdup(arg);
@@ -371,6 +390,11 @@ static void handle_arg_reserved_va(const char *arg)
 static void handle_arg_singlestep(const char *arg)
 {
     singlestep = 1;
+}
+
+static void handle_arg_perfmap(const char *arg)
+{
+    tb_enable_perfmap();
 }
 
 static void handle_arg_strace(const char *arg)
@@ -438,6 +462,14 @@ static const struct qemu_argument arg_table[] = {
      "argv0",      "forces target process argv[0] to be 'argv0'"},
     {"r",          "QEMU_UNAME",       true,  handle_arg_uname,
      "uname",      "set qemu uname release string to 'uname'"},
+    {"count-ifetch", "QEMU_COUNT_IFETCH", false,  handle_arg_count_ifetch,
+     "",           "count the number of fetched instructions"},
+    {"clock-ifetch", "QEMU_CLOCK_IFETCH", true,  handle_arg_clock_ifetch,
+     "freq",       "make user-time related syscalls return f(ifetch / freq)"},
+#ifdef CONFIG_TCG_PLUGIN
+    {"tcg-plugin", "QEMU_TCG_PLUGIN", true,  handle_arg_tcg_plugin,
+     "dso",        "load the dynamic shared object as TCG plugin"},
+#endif /* CONFIG_TCG_PLUGIN */
     {"B",          "QEMU_GUEST_BASE",  true,  handle_arg_guest_base,
      "address",    "set guest_base address to 'address'"},
     {"R",          "QEMU_RESERVED_VA", true,  handle_arg_reserved_va,
@@ -463,6 +495,8 @@ static const struct qemu_argument arg_table[] = {
     {"plugin",     "QEMU_PLUGIN",      true,  handle_arg_plugin,
      "",           "[file=]<file>[,arg=<string>]"},
 #endif
+    {"perfmap",    "QEMU_PERFMAP",     false,  handle_arg_perfmap,
+     "",           "emit /tmp/perf-$PID.map file for linux perf"},
     {"version",    "QEMU_VERSION",     false, handle_arg_version,
      "",           "display version information and exit"},
 #if defined(TARGET_XTENSA)
@@ -861,8 +895,14 @@ int main(int argc, char **argv, char **envp)
 
     target_cpu_copy_regs(env, regs);
 
+    qemu_init_exec_dir(argv[0]);
+    initialize_ifetch();
+    /* initialize plugins to allow tpi_init to be called.
+     * Allows plugin to declare their parameters. */
+    tcg_plugin_initialize_all();
+
     if (gdbstub_port) {
-        if (gdbserver_start(gdbstub_port) < 0) {
+        if (gdbserver_start(gdbstub_port, exec_path) < 0) {
             fprintf(stderr, "qemu: could not open gdbserver on port %d\n",
                     gdbstub_port);
             exit(EXIT_FAILURE);

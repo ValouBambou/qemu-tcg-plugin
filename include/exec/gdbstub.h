@@ -167,7 +167,7 @@ static inline uint8_t * gdb_get_reg_ptr(GByteArray *buf, int len)
 #endif
 
 #ifdef CONFIG_USER_ONLY
-int gdbserver_start(int);
+int gdbserver_start(int, const char* bin_name);
 #else
 int gdbserver_start(const char *port);
 #endif

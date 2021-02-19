@@ -3931,6 +3931,62 @@ SRST
     used to load the initial VM state.
 ERST
 
+DEF("count-ifetch", 0, QEMU_OPTION_count_ifetch, \
+    "-count-ifetch\n" \
+    "                count the number of fetched instructions\n",
+     QEMU_ARCH_ALL)
+STEXI
+@item -count-ifetch
+@findex -count-ifetch
+Report the number of fetched instructions at the end of the execution.
+This is equivalent to the number of executed instructions if you
+consider that all fetched instructions are executed even if they are
+invalidated, as it's typically the case with predicated instructions.
+This option is useful to evaluate some compiler optimizations and is
+not related to the option @option{-icount}.
+ETEXI
+
+DEF("clock-ifetch", HAS_ARG, QEMU_OPTION_clock_ifetch, \
+    "-clock-ifetch <frequency>\n" \
+    "                make user-time related syscalls return f(ifetch / <frequency>)\n",
+     QEMU_ARCH_ARM)
+STEXI
+@item -clock-ifetch @var{frequency}
+@findex -clock-ifetch
+This option makes user-time related system-calls -- times() for Linux
+and clock() for ARM semi-hosting -- to return the result of the
+following formula instead of the host user-time:
+@example
+    (ifetch_counter / frequency) * sysconf(_SC_CLK_TCK)
+@end example
+
+where @var{ifetch_counter} is the number of fetched instructions,
+@var{frequency} is the number of fetched instructions per second
+(argument of the option @option{-clock-ifetch}) and
+@var{sysconf(_SC_CLK_TCK)} is the current number of clock ticks per
+second, this latter is hard-coded to 100 for ARM semi-hosting.
+
+This option is mainly useful to evaluate some compiler optimizations
+on part of a program, for instance:
+@example
+    before = clock();
+    /* evaluated code here */
+    after = clock();
+@end example
+
+Note that the type of the value returned by times() and clock() can be
+a 32-bit integer only, and thus it can overflow quite quickly.  This
+is where the "frequency" parameter comes in handy: it allows to scale
+down the returned values, for example:
+@example
+    $ qemu -semihosting -nographic -clock-ifetch 1Hz -kernel ./test-clock
+    274021248 - 1458032704 = 18446744072525540160  # overflow!
+
+    $ qemu -semihosting -nographic  -clock-ifetch 1KHz -kernel ./test-clock
+    1447000000 - 5000000 = 1442000000              # OK
+@end example
+ETEXI
+
 DEF("watchdog", HAS_ARG, QEMU_OPTION_watchdog, \
     "-watchdog model\n" \
     "                enable virtual hardware watchdog [default=none]\n",
@@ -4016,6 +4072,19 @@ SRST
     Set TCG translation block cache size. Deprecated, use
     '\ ``-accel tcg,tb-size=n``\ ' instead.
 ERST
+
+#ifdef CONFIG_TCG_PLUGIN
+DEF("tcg-plugin", HAS_ARG, QEMU_OPTION_tcg_plugin, \
+    "-tcg-plugin dso load the dynamic shared object as TCG plugin\n", QEMU_ARCH_ALL)
+STEXI
+@item -tcg-plugin @var{dso}
+@findex -tcg-plugin
+The TCG plugin support allows an external shared library to be
+notified each time a basic block is translated into the TCG internal
+representation, in the aim of instrumenting the emulated code to
+produce program analysis, à la Valgrind or DynamoRIO for instance.
+ETEXI
+#endif
 
 DEF("incoming", HAS_ARG, QEMU_OPTION_incoming, \
     "-incoming tcp:[host]:port[,to=maxport][,ipv4][,ipv6]\n" \
@@ -5018,6 +5087,14 @@ SRST
 
             (qemu) qom-set /objects/iothread1 poll-max-ns 100000
 ERST
+
+DEF("perfmap", 0, QEMU_OPTION_PERFMAP, \
+    "-perfmap        generate a /tmp/perf-${pid}.map file for perf\n",
+    QEMU_ARCH_ALL)
+STEXI
+This will cause QEMU to generate a map file for Linux perf tools that will
+ allow basic profiling information to be broken down into basic blocks.
+ETEXI
 
 
 HXCOMM This is the last statement. Insert new options before this line!

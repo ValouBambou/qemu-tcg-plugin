@@ -60,6 +60,7 @@ static void superh_cpu_reset(DeviceState *dev)
 
     env->pc = 0xA0000000;
 #if defined(CONFIG_USER_ONLY)
+    env->gUSA_end = 0;
     env->fpscr = FPSCR_PR; /* value for userspace according to the kernel */
     set_float_rounding_mode(float_round_nearest_even, &env->fp_status); /* ?! */
 #else

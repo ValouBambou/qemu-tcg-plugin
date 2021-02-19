@@ -18,6 +18,16 @@ char *plugin_disas(CPUState *cpu, uint64_t addr, size_t size);
 
 /* Look up symbol for debugging purpose.  Returns "" if unknown. */
 const char *lookup_symbol(target_ulong orig_addr);
+bool lookup_symbol2(target_ulong orig_addr, const char **symbol, const char **filename);
+bool lookup_symbol3(target_ulong orig_addr, const char **symbol, const char **filename, uint64_t *address);
+bool lookup_symbol4(target_ulong orig_addr, const char **symbol, const char **filename, uint64_t *address, uint64_t *size);
+bool lookup_symbol5(target_ulong orig_addr, const char **symbol, const char **filename, uint64_t *address, uint64_t *size, uint64_t *load_bias);
+
+/* Look up symbol bounds by name for debugging purpose.  Returns false if unknown. */
+bool find_symbol_bounds(const char *name, bool is_elf_class64, uint64_t *start, uint64_t *size);
+
+/* Look up for the qemu-translated PC (with load bias) */
+target_ulong translate_pc(target_ulong address_in_file, const char *filename);
 #endif
 
 struct syminfo;
@@ -25,9 +35,9 @@ struct elf32_sym;
 struct elf64_sym;
 
 #if defined(CONFIG_USER_ONLY)
-typedef const char *(*lookup_symbol_t)(struct syminfo *s, target_ulong orig_addr);
+typedef const char *(*lookup_symbol_t)(struct syminfo *s, target_ulong orig_addr, target_ulong *symbol_addr, target_ulong *symbol_size);
 #else
-typedef const char *(*lookup_symbol_t)(struct syminfo *s, hwaddr orig_addr);
+typedef const char *(*lookup_symbol_t)(struct syminfo *s, hwaddr orig_addr, hwaddr *symbol_addr, hwaddr *symbol_size);
 #endif
 
 struct syminfo {
@@ -38,10 +48,13 @@ struct syminfo {
       struct elf64_sym *elf64;
     } disas_symtab;
     const char *disas_strtab;
+    const char *filename;
+    size_t load_bias;
     struct syminfo *next;
 };
 
 /* Filled in by elfload.c.  Simplistic, but will do for now. */
 extern struct syminfo *syminfos;
+extern uint64_t find_symbol(const char *name, int is_elf_class64);
 
 #endif /* QEMU_DISAS_H */

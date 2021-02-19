@@ -80,6 +80,9 @@ env:
     - CCACHE_SLOPPINESS="include_file_ctime,include_file_mtime"
     - CCACHE_MAXSIZE=1G
     - G_MESSAGES_DEBUG=error
+  matrix:
+    # test only one build variant with plugins activated
+    - CONFIG="--enable-capstone --enable-tcg-plugin --target-list=x86_64-linux-user,arm-linux-user,aarch64-linux-user,x86_64-softmmu,arm-softmmu,aarch64-softmmu"
 
 
 git:

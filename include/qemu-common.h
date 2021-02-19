@@ -59,6 +59,8 @@ int qemu_openpty_raw(int *aslave, char *pty_name);
     sendto(sockfd, buf, len, flags, destaddr, addrlen)
 #endif
 
+extern void tb_enable_perfmap(void);
+
 void cpu_exec_init_all(void);
 void cpu_exec_step_atomic(CPUState *cpu);
 
@@ -73,6 +75,15 @@ void cpu_exec_step_atomic(CPUState *cpu);
  * choice of page size and the requested page size is smaller than that).
  */
 bool set_preferred_target_page_bits(int bits);
+
+/* Count the number of fetched instructions.  */
+extern int count_ifetch;
+void initialize_ifetch(void);
+void show_all_ifetch_counters(void);
+
+/* Number of fetched instructions per second.  */
+extern uint64_t clock_ifetch;
+uint64_t convert_string_to_frequency(const char *string);
 
 /**
  * finalize_target_page_bits:

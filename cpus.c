@@ -44,6 +44,8 @@
 #include "sysemu/whpx.h"
 #include "exec/exec-all.h"
 
+#include "tcg-plugin.h"
+
 #include "qemu/thread.h"
 #include "qemu/plugin.h"
 #include "sysemu/cpus.h"
@@ -1886,6 +1888,9 @@ void pause_all_vcpus(void)
     qemu_mutex_unlock_iothread();
     replay_mutex_lock();
     qemu_mutex_lock_iothread();
+
+    show_all_ifetch_counters();
+    tcg_plugin_cpus_stopped();
 }
 
 void cpu_resume(CPUState *cpu)

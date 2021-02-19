@@ -43,6 +43,8 @@
 #include "hw/boards.h"
 #endif
 
+#include "tcg/tcg-plugin.h"
+
 #define MAX_PACKET_LENGTH 4096
 
 #include "qemu/sockets.h"
@@ -398,8 +400,36 @@ static void reset_gdbserver_state(void)
 bool gdb_has_xml;
 
 #ifdef CONFIG_USER_ONLY
+
+static pthread_mutex_t block_cpus_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool cpus_blocked = false;
+static const char* current_bin_name;
+
+static void block_cpus(void)
+{
+    if (cpus_blocked)
+        return;
+
+    CPUState* current = gdbserver_state.c_cpu;
+
+    cpus_blocked = true;
+    pthread_mutex_lock(&block_cpus_mutex);
+
+    CPUState* cpu;
+    CPU_FOREACH(cpu)
+    {
+        if (cpu == current)
+            continue;
+
+        cpu->wait_condition = true;
+        cpu->wait_mutex_to_lock = &block_cpus_mutex;
+        cpu_interrupt(cpu, CPU_INTERRUPT_WAIT);
+    }
+}
+
 /* XXX: This is not thread safe.  Do we care?  */
 static int gdbserver_fd = -1;
+static int gdbserver_port = -1;
 
 static int get_char(void)
 {
@@ -2582,7 +2612,7 @@ static int gdb_handle_packet(const char *line_buf)
         }
         break;
     case 'q':
-        {
+       {
             static const GdbCmdParseEntry gen_query_cmd_desc = {
                 .handler = handle_gen_query,
                 .cmd = "q",
@@ -2960,6 +2990,8 @@ void gdb_exit(CPUArchState *env, int code)
 {
   char buf[4];
 
+  tcg_plugin_cpus_stopped();
+
   if (!gdbserver_state.init) {
       return;
   }
@@ -3023,6 +3055,8 @@ gdb_handlesig(CPUState *cpu, int sig)
         snprintf(buf, sizeof(buf), "S%02x", target_signal_to_gdb(sig));
         put_packet(buf);
     }
+
+    block_cpus();
     /* put_packet() might have detected that the peer terminated the
        connection.  */
     if (gdbserver_state.fd < 0) {
@@ -3059,6 +3093,8 @@ gdb_handlesig(CPUState *cpu, int sig)
 void gdb_signalled(CPUArchState *env, int sig)
 {
     char buf[4];
+
+    tcg_plugin_cpus_stopped();
 
     if (gdbserver_fd < 0 || gdbserver_state.fd < 0) {
         return;
@@ -3135,7 +3171,7 @@ static int gdbserver_open(int port)
     return fd;
 }
 
-int gdbserver_start(int port)
+int gdbserver_start(int port, const char* bin_name)
 {
     gdbserver_fd = gdbserver_open(port);
     if (gdbserver_fd < 0)
@@ -3146,6 +3182,20 @@ int gdbserver_start(int port)
         gdbserver_fd = -1;
         return -1;
     }
+    gdbserver_port = port;
+
+    /* update binary name */
+    if (current_bin_name)
+    {
+        free((char*)current_bin_name);
+        current_bin_name = NULL;
+    }
+
+    if (bin_name)
+    {
+        current_bin_name = realpath(bin_name, NULL);
+    }
+
     return 0;
 }
 

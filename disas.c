@@ -16,6 +16,88 @@ typedef struct CPUDebug {
 /* Filled in by elfload.c.  Simplistic, but will do for now. */
 struct syminfo *syminfos = NULL;
 
+/* Retrieve the address of a symbol.  */
+uint64_t find_symbol(const char *name, int is_elf_class64)
+{
+    struct syminfo *syminfo;
+    int i;
+
+    for (syminfo = syminfos; syminfo; syminfo = syminfo->next) {
+        struct elf64_sym *syms64 = NULL;
+        struct elf32_sym *syms32 = NULL;
+
+        if (is_elf_class64) {
+            syms64 = syminfo->disas_symtab.elf64;
+        }
+        else {
+            syms32 = syminfo->disas_symtab.elf32;
+        }
+
+#define SYMS(i, field) (is_elf_class64            \
+                        ? syms64[(i)].st_ ## field     \
+                        : syms32[(i)].st_ ## field)
+
+        for (i = 0; i < syminfo->disas_num_syms; i++) {
+            if (strcmp(name, syminfo->disas_strtab + SYMS(i, name))) {
+                continue;
+            }
+
+            return (uint64_t)SYMS(i, value);
+        }
+
+#undef SYMS
+    }
+    return 0;
+}
+
+bool find_symbol_bounds(const char *name, bool is_elf_class64, uint64_t *start, uint64_t *size)
+{
+  struct syminfo *syminfo;
+  int i;
+
+  for (syminfo = syminfos; syminfo; syminfo = syminfo->next) {
+    struct elf64_sym *syms64 = NULL;
+    struct elf32_sym *syms32 = NULL;
+
+    if (is_elf_class64) {
+      syms64 = syminfo->disas_symtab.elf64;
+    }
+    else {
+      syms32 = syminfo->disas_symtab.elf32;
+    }
+
+#define SYMS(i, field) (is_elf_class64 ? syms64[(i)].st_ ## field  \
+                                       : syms32[(i)].st_ ## field)
+
+    for (i = 0; i < syminfo->disas_num_syms; i++) {
+      if (strcmp(name, syminfo->disas_strtab + SYMS(i, name))) {
+        continue;
+      }
+
+      *start = (uint64_t)SYMS(i, value);
+      *size  = (uint64_t)SYMS(i, size);
+      return true;
+    }
+
+#undef SYMS
+  }
+  return false;
+}
+
+target_ulong
+translate_pc(target_ulong address_in_file, const char *filename) {
+  struct syminfo *syminfo;
+  target_ulong ret = address_in_file;
+  for (syminfo = syminfos; syminfo; syminfo = syminfo->next) {
+    if (!strcmp(syminfo->filename, filename)) {
+      return ret + syminfo->load_bias;
+    }
+  }
+
+  // Not found
+  return 0;
+}
+
 /* Get LENGTH bytes from info's buffer, at target address memaddr.
    Transfer them to myaddr.  */
 int
@@ -687,7 +769,7 @@ const char *lookup_symbol(target_ulong orig_addr)
     struct syminfo *s;
 
     for (s = syminfos; s; s = s->next) {
-        symbol = s->lookup_symbol(s, orig_addr);
+        symbol = s->lookup_symbol(s, orig_addr, NULL, NULL);
         if (symbol[0] != '\0') {
             break;
         }
@@ -695,6 +777,103 @@ const char *lookup_symbol(target_ulong orig_addr)
 
     return symbol;
 }
+
+/* Look up symbol/filename for debugging purpose.  */
+bool lookup_symbol2(target_ulong orig_addr, const char **symbol, const char **filename)
+{
+    struct syminfo *s;
+
+    for (s = syminfos; s; s = s->next) {
+        *symbol = s->lookup_symbol(s, orig_addr, NULL, NULL);
+        if (*symbol[0] != '\0') {
+            *filename = s->filename;
+            return true;
+        }
+    }
+
+    *symbol = "";
+    *filename = "";
+    return false;
+}
+
+bool lookup_symbol3(target_ulong orig_addr, const char **symbol, const char **filename, uint64_t *address)
+{
+    struct syminfo *s;
+
+    for (s = syminfos; s; s = s->next) {
+#if defined(CONFIG_USER_ONLY)
+        target_ulong target_address;
+#else
+        hwaddr target_address;
+#endif
+        *symbol = s->lookup_symbol(s, orig_addr, &target_address, NULL);
+        if (*symbol[0] != '\0') {
+            *filename = s->filename;
+            *address = target_address;
+            return true;
+        }
+    }
+
+    *symbol = "";
+    *filename = "";
+    *address = orig_addr;
+    return false;
+}
+
+bool lookup_symbol4(target_ulong orig_addr, const char **symbol, const char **filename, uint64_t *address, uint64_t *size)
+{
+    struct syminfo *s;
+
+    for (s = syminfos; s; s = s->next) {
+#if defined(CONFIG_USER_ONLY)
+        target_ulong target_address, target_size;
+#else
+        hwaddr target_address, target_size;
+#endif
+        *symbol = s->lookup_symbol(s, orig_addr, &target_address, &target_size);
+        if (*symbol[0] != '\0') {
+            *filename = s->filename;
+            *address = target_address;
+            *size = target_size;
+            return true;
+        }
+    }
+
+    *symbol = "";
+    *filename = "";
+    *address = orig_addr;
+    *size = 0;
+    return false;
+}
+
+bool lookup_symbol5(target_ulong orig_addr, const char **symbol, const char **filename, uint64_t *address, uint64_t *size, uint64_t *load_bias)
+{
+  struct syminfo *s;
+
+  for (s = syminfos; s; s = s->next) {
+#if defined(CONFIG_USER_ONLY)
+    target_ulong target_address, target_size;
+#else
+    hwaddr target_address, target_size;
+#endif
+    *symbol = s->lookup_symbol(s, orig_addr, &target_address, &target_size);
+    if (*symbol[0] != '\0') {
+      *filename = s->filename;
+      *address = target_address;
+      *size = target_size;
+      *load_bias = s->load_bias;
+      return true;
+    }
+  }
+
+  *symbol = "";
+  *filename = "";
+  *address = orig_addr;
+  *size = 0;
+  *load_bias = 0;
+  return false;
+}
+
 
 #if !defined(CONFIG_USER_ONLY)
 

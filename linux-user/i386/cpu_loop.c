@@ -312,6 +312,16 @@ void cpu_loop(CPUX86State *env)
         case EXCP_DEBUG:
             gen_signal(env, TARGET_SIGTRAP, TARGET_TRAP_BRKPT, 0);
             break;
+        case EXCP_WAIT:
+            {
+                while(cs->wait_condition)
+                {
+                    pthread_mutex_lock(cs->wait_mutex_to_lock);
+                    pthread_mutex_unlock(cs->wait_mutex_to_lock);
+                }
+
+            }
+            break;
         case EXCP_ATOMIC:
             cpu_exec_step_atomic(cs);
             break;

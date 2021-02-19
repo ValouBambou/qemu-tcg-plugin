@@ -40,6 +40,7 @@ struct image_info {
         abi_ulong       start_stack;
         abi_ulong       stack_limit;
         abi_ulong       entry;
+        abi_ulong       program_offset;
         abi_ulong       code_offset;
         abi_ulong       data_offset;
         abi_ulong       saved_auxv;
@@ -197,6 +198,8 @@ int loader_exec(int fdexec, const char *filename, char **argv, char **envp,
  * when handling signals.
  */
 int info_is_fdpic(struct image_info *info);
+
+void load_symbols_from_fd(int fd, abi_ulong load_bias);
 
 uint32_t get_elf_eflags(int fd);
 int load_elf_binary(struct linux_binprm *bprm, struct image_info *info);
@@ -371,6 +374,7 @@ extern long safe_syscall_base(int *pending, long number, ...);
 int host_to_target_waitstatus(int status);
 
 /* strace.c */
+const char *get_syscall_name(int num);
 void print_syscall(int num,
                    abi_long arg1, abi_long arg2, abi_long arg3,
                    abi_long arg4, abi_long arg5, abi_long arg6);
@@ -445,6 +449,10 @@ extern abi_ulong mmap_next_start;
 abi_ulong mmap_find_vma(abi_ulong, abi_ulong, abi_ulong);
 void mmap_fork_start(void);
 void mmap_fork_end(int child);
+/* return file mapped at address @addr, its @name and @base_addr */
+bool get_mapped_file(uint64_t addr, const char** name, uint64_t* base_addr);
+/* add information that file @filename is mapped @addr for a length @length */
+void add_mapinfo(const char* filename, uint64_t addr, size_t length);
 
 /* main.c */
 extern unsigned long guest_stack_size;

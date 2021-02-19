@@ -11,6 +11,7 @@
 #include "qemu/queue.h"
 #include "qemu/guest-random.h"
 #include "qemu/units.h"
+#include "tcg/tcg-plugin.h"
 
 #ifdef _ARCH_PPC64
 #undef ARCH_DLINFO
@@ -1661,7 +1662,7 @@ static inline void bswap_mips_abiflags(Mips_elf_abiflags_v0 *abiflags) { }
 #ifdef USE_ELF_CORE_DUMP
 static int elf_core_dump(int, const CPUArchState *);
 #endif /* USE_ELF_CORE_DUMP */
-static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias);
+static void load_symbols(struct elfhdr *hdr, int fd, const char *filename, abi_ulong load_bias);
 
 /* Verify the portions of EHDR within E_IDENT for the target.
    This can be performed before bswapping the entire header.  */
@@ -2444,6 +2445,10 @@ static void load_elf_image(const char *image_name, int image_fd,
         }
     }
 
+    /* load_bias will be erased for executable with interpreter load_bias,
+     * keep original one in program_offset */
+    info->program_offset = load_bias;
+
     info->load_bias = load_bias;
     info->code_offset = load_bias;
     info->data_offset = load_bias;
@@ -2570,8 +2575,8 @@ static void load_elf_image(const char *image_name, int image_fd,
         info->brk = info->end_code;
     }
 
-    if (qemu_log_enabled()) {
-        load_symbols(ehdr, image_fd, load_bias);
+    if (qemu_log_enabled() || tcg_plugin_enabled()) {
+        load_symbols(ehdr, image_fd, image_name, load_bias);
     }
 
     mmap_unlock();
@@ -2630,7 +2635,7 @@ static int symfind(const void *s0, const void *s1)
     return result;
 }
 
-static const char *lookup_symbolxx(struct syminfo *s, target_ulong orig_addr)
+static const char *lookup_symbolxx(struct syminfo *s, target_ulong orig_addr, target_ulong *symbol_addr, target_ulong *symbol_size)
 {
 #if ELF_CLASS == ELFCLASS32
     struct elf_sym *syms = s->disas_symtab.elf32;
@@ -2643,9 +2648,13 @@ static const char *lookup_symbolxx(struct syminfo *s, target_ulong orig_addr)
 
     sym = bsearch(&orig_addr, syms, s->disas_num_syms, sizeof(*syms), symfind);
     if (sym != NULL) {
+        if (symbol_addr != NULL) *symbol_addr = sym->st_value;
+        if (symbol_size != NULL) *symbol_size = sym->st_size;
         return s->disas_strtab + sym->st_name;
     }
 
+    if (symbol_addr != NULL) *symbol_addr = orig_addr;
+    if (symbol_size != NULL) *symbol_size = 0;
     return "";
 }
 
@@ -2660,7 +2669,7 @@ static int symcmp(const void *s0, const void *s1)
 }
 
 /* Best attempt to load symbols from this ELF object. */
-static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
+static void load_symbols(struct elfhdr *hdr, int fd, const char *filename, abi_ulong load_bias)
 {
     int i, shnum, nsyms, sym_idx = 0, str_idx = 0;
     uint64_t segsz;
@@ -2679,6 +2688,15 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
     bswap_shdr(shdr, shnum);
     for (i = 0; i < shnum; ++i) {
         if (shdr[i].sh_type == SHT_SYMTAB) {
+            sym_idx = i;
+            str_idx = shdr[i].sh_link;
+            goto found;
+        }
+    }
+
+    /* search in dynsym if no symtab is available */
+    for (i = 0; i < shnum; ++i) {
+        if (shdr[i].sh_type == SHT_DYNSYM) {
             sym_idx = i;
             str_idx = shdr[i].sh_link;
             goto found;
@@ -2758,7 +2776,9 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
     s->disas_symtab.elf64 = syms;
 #endif
     s->lookup_symbol = lookup_symbolxx;
+    s->filename = g_strdup(filename);
     s->next = syminfos;
+    s->load_bias = load_bias;
     syminfos = s;
 
     return;
@@ -2913,6 +2933,43 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
 
     return 0;
 }
+
+
+/* Load the symbols of the object ``fd`` dynamic loaded at the address
+ * ``load_bias``.  */
+void load_symbols_from_fd(int fd, abi_ulong load_bias)
+{
+    char path[PATH_MAX];
+    char proc_fd[PATH_MAX];
+    ssize_t status;
+    struct elfhdr ehdr;
+
+    status = snprintf(proc_fd, PATH_MAX, "/proc/self/fd/%d", fd);
+    if (status < 0 || status >= PATH_MAX) {
+        return;
+    }
+
+    status = readlink(proc_fd, path, PATH_MAX);
+    if (status < 0 || status >= PATH_MAX) {
+        return;
+    }
+    path[status] = '\0';
+    status = pread(fd, &ehdr, sizeof(struct elfhdr), 0);
+    if (status < 0) {
+        return;
+    }
+
+    if (!elf_check_ident(&ehdr)) {
+        return;
+    }
+    bswap_ehdr(&ehdr);
+    if (!elf_check_ehdr(&ehdr)) {
+        return;
+    }
+
+    load_symbols(&ehdr, fd, path, ehdr.e_type == ET_EXEC ? 0 : load_bias);
+}
+
 
 #ifdef USE_ELF_CORE_DUMP
 /*

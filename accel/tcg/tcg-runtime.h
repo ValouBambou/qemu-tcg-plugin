@@ -1,3 +1,8 @@
+
+#ifdef CONFIG_TCG_PLUGIN
+DEF_HELPER_FLAGS_6(tcg_plugin_pre_tb, 0, void, i64, i64, i64, i64, i64, i64)
+#endif
+
 DEF_HELPER_FLAGS_2(div_i32, TCG_CALL_NO_RWG_SE, s32, s32, s32)
 DEF_HELPER_FLAGS_2(rem_i32, TCG_CALL_NO_RWG_SE, s32, s32, s32)
 DEF_HELPER_FLAGS_2(divu_i32, TCG_CALL_NO_RWG_SE, i32, i32, i32)

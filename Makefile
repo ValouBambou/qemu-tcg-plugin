@@ -170,6 +170,7 @@ ifdef CONFIG_TRACE_UST
 TRACE_HEADERS += trace-ust-root.h $(trace-events-subdirs:%=%/trace-ust.h)
 endif
 
+generated-files-y += syscall_fwd_compat.h
 generated-files-y += $(TRACE_HEADERS)
 generated-files-y += $(TRACE_SOURCES)
 generated-files-y += $(BUILD_DIR)/trace-events-all
@@ -548,6 +549,11 @@ CAP_CFLAGS += -DCAPSTONE_HAS_ARM
 CAP_CFLAGS += -DCAPSTONE_HAS_ARM64
 CAP_CFLAGS += -DCAPSTONE_HAS_POWERPC
 CAP_CFLAGS += -DCAPSTONE_HAS_X86
+ifdef CONFIG_TCG_PLUGIN
+# TCG plugins are shared libraries, so in order for plugins to link to capstone
+# it needs to be built with -fPIC
+CAP_CFLAGS += -fPIC
+endif
 
 .PHONY: capstone/all
 capstone/all: .git-submodule-status
@@ -668,6 +674,9 @@ qapi-gen-timestamp: $(qapi-modules) $(qapi-py)
 		-o "qapi" -b $<, \
 		"GEN","$(@:%-timestamp=%)")
 	@>$@
+
+syscall_fwd_compat.h: $(SRC_PATH)/scripts/create_compat
+		$(call quiet-command,$(SHELL) $(SRC_PATH)/scripts/create_compat $(ARCH) > $@, "GEN", "$@")
 
 qapi-modules-storage-daemon = \
 	$(SRC_PATH)/storage-daemon/qapi/qapi-schema.json \
