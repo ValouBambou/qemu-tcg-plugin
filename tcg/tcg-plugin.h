@@ -39,6 +39,7 @@
 
 #include "tcg/tcg.h"
 #include "tcg/tcg-op.h"
+#include "tcg/tcg-internal.h"
 /* must be included after "tcg.h" */
 #include "exec/exec-all.h" /* TranslationBlock */
 
@@ -77,11 +78,16 @@ extern bool tcg_plugin_treat_command(const char *command, char **answer);
 /* This structure shall be 64 bits, see call_tb_helper_code() for
  * details.  */
 typedef struct {
-    uint16_t cpu_index;
-    uint16_t size;
     union {
-        char type;
-        uint32_t icount;
+        struct {
+            uint16_t cpu_index;
+            uint16_t size;
+            union {
+                char type;
+                uint32_t icount;
+            };
+        } __attribute__ ((__packed__, __may_alias__));
+        uint64_t _raw;
     };
 } __attribute__((__packed__, __may_alias__)) TPIHelperInfo;
 
@@ -301,7 +307,7 @@ struct TCGPluginInterface {
 #define TPI_DECL_FUNC_FLAGS_0(tpi, NAME, FLAGS, ret) do {                \
         static const TCGHelperInfo _info =                               \
             { .func = NAME, .name = #NAME, .flags = FLAGS,               \
-              .sizemask = dh_sizemask(ret, 0) };                         \
+              .typemask = dh_typemask(ret, 0) };                         \
         tcg_define_helper(&_info);                                       \
     } while (0)
 
@@ -310,7 +316,7 @@ struct TCGPluginInterface {
 #define TPI_DECL_FUNC_FLAGS_1(tpi, NAME, FLAGS, ret, t1) do {            \
         static const TCGHelperInfo _info =                               \
             { .func = NAME, .name = #NAME, .flags = FLAGS,               \
-              .sizemask = dh_sizemask(ret, 0) | dh_sizemask(t1, 1) };    \
+              .typemask = dh_typemask(ret, 0) | dh_typemask(t1, 1) };    \
         tcg_define_helper(&_info);                                       \
     } while (0)
 
@@ -319,8 +325,8 @@ struct TCGPluginInterface {
 #define TPI_DECL_FUNC_FLAGS_2(tpi, NAME, FLAGS, ret, t1, t2) do {        \
         static const TCGHelperInfo _info =                               \
             { .func = NAME, .name = #NAME, .flags = FLAGS,               \
-              .sizemask = dh_sizemask(ret, 0) | dh_sizemask(t1, 1)       \
-              | dh_sizemask(t2, 2) };                                    \
+              .typemask = dh_typemask(ret, 0) | dh_typemask(t1, 1)       \
+              | dh_typemask(t2, 2) };                                    \
         tcg_define_helper(&_info);                                       \
     } while (0)
 
@@ -329,8 +335,8 @@ struct TCGPluginInterface {
 #define TPI_DECL_FUNC_FLAGS_3(tpi, NAME, FLAGS, ret, t1, t2, t3) do {    \
         static const TCGHelperInfo _info =                               \
             { .func = NAME, .name = #NAME, .flags = FLAGS,               \
-              .sizemask = dh_sizemask(ret, 0) | dh_sizemask(t1, 1)       \
-              | dh_sizemask(t2, 2) | dh_sizemask(t3, 3) };               \
+              .typemask = dh_typemask(ret, 0) | dh_typemask(t1, 1)       \
+              | dh_typemask(t2, 2) | dh_typemask(t3, 3) };               \
         tcg_define_helper(&_info);                                       \
     } while (0)
 
@@ -339,8 +345,8 @@ struct TCGPluginInterface {
 #define TPI_DECL_FUNC_FLAGS_4(tpi, NAME, FLAGS, ret, t1, t2, t3, t4) do {       \
         static const TCGHelperInfo _info =                                      \
             { .func = NAME, .name = #NAME, .flags = FLAGS,                      \
-              .sizemask = dh_sizemask(ret, 0) | dh_sizemask(t1, 1)              \
-              | dh_sizemask(t2, 2) | dh_sizemask(t3, 3) | dh_sizemask(t4, 4) }; \
+              .typemask = dh_typemask(ret, 0) | dh_typemask(t1, 1)              \
+              | dh_typemask(t2, 2) | dh_typemask(t3, 3) | dh_typemask(t4, 4) }; \
         tcg_define_helper(&_info);                                              \
     } while (0)
 
@@ -349,9 +355,9 @@ struct TCGPluginInterface {
 #define TPI_DECL_FUNC_FLAGS_5(tpi, NAME, FLAGS, ret, t1, t2, t3, t4, t5) do { \
         static const TCGHelperInfo _info =                                    \
             { .func = NAME, .name = #NAME, .flags = FLAGS,                    \
-              .sizemask = dh_sizemask(ret, 0) | dh_sizemask(t1, 1)            \
-              | dh_sizemask(t2, 2) | dh_sizemask(t3, 3) | dh_sizemask(t4, 4)  \
-              | dh_sizemask(t5, 5) };                                         \
+              .typemask = dh_typemask(ret, 0) | dh_typemask(t1, 1)            \
+              | dh_typemask(t2, 2) | dh_typemask(t3, 3) | dh_typemask(t4, 4)  \
+              | dh_typemask(t5, 5) };                                         \
         tcg_define_helper(&_info);                                            \
     } while (0)
 
@@ -379,6 +385,7 @@ extern const TranslationBlock *tpi_tb(const TCGPluginInterface *tpi);
 extern uint64_t tpi_tb_address(const TranslationBlock *tb);
 extern uint32_t tpi_tb_size(const TranslationBlock *tb);
 extern uint32_t tpi_tb_icount(const TranslationBlock *tb);
+extern TCGArg tpi_tb_icount_tcgarg(const TranslationBlock *tb);
 
 /*
  * Thread related identifiers.

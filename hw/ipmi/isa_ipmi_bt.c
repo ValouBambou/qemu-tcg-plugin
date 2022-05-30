@@ -23,7 +23,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "hw/irq.h"
@@ -31,18 +30,18 @@
 #include "hw/isa/isa.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "qom/object.h"
 
 #define TYPE_ISA_IPMI_BT "isa-ipmi-bt"
-#define ISA_IPMI_BT(obj) OBJECT_CHECK(ISAIPMIBTDevice, (obj), \
-                                      TYPE_ISA_IPMI_BT)
+OBJECT_DECLARE_SIMPLE_TYPE(ISAIPMIBTDevice, ISA_IPMI_BT)
 
-typedef struct ISAIPMIBTDevice {
+struct ISAIPMIBTDevice {
     ISADevice dev;
     int32_t isairq;
     qemu_irq irq;
     IPMIBT bt;
     uint32_t uuid;
-} ISAIPMIBTDevice;
+};
 
 static void isa_ipmi_bt_get_fwinfo(struct IPMIInterface *ii, IPMIFwInfo *info)
 {
@@ -93,7 +92,7 @@ static void isa_ipmi_bt_realize(DeviceState *dev, Error **errp)
     }
 
     if (iib->isairq > 0) {
-        isa_init_irq(isadev, &iib->irq, iib->isairq);
+        iib->irq = isa_get_irq(isadev, iib->isairq);
         iib->bt.use_irq = 1;
         iib->bt.raise_irq = isa_ipmi_bt_raise_irq;
         iib->bt.lower_irq = isa_ipmi_bt_lower_irq;

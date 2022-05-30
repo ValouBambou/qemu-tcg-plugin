@@ -509,14 +509,14 @@ void tpi_init(TCGPluginInterface *tpi)
     int i, argc;
     char **argv;
     char *cmdline;
-    const char *latencies;
+    const char *latencies = getenv("DINEROIV_LATENCIES");
     const char *output_flags_str;
 
     TPI_INIT_VERSION(tpi);
     TPI_DECL_FUNC_3(tpi, after_exec_opc, void, i64, i64, i64);
 
     /* Sorry, for simplicity works on 64 bits hosts only. */
-    assert(TCG_TARGET_REG_BITS == TARGET_LONG_BITS);
+    assert(TCG_TARGET_REG_BITS == 8*TARGET_LONG_SIZE);
     assert(TCG_TARGET_REG_BITS == 64);
 
     assert(sizeof(access_info_t) == sizeof(uint64_t));
@@ -533,7 +533,6 @@ void tpi_init(TCGPluginInterface *tpi)
     parse_output_flags(output_flags_str);
 
     if (output_flags & OUTPUT_CYCLES) {
-        latencies = getenv("DINEROIV_LATENCIES");
         if (latencies == NULL) {
             latencies = DINEROIV_DEFAULT_LATENCIES;
             fprintf(output, "# WARNING: using default latencies "

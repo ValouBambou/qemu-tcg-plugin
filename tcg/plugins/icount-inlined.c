@@ -61,10 +61,9 @@ static void before_gen_tb(const TCGPluginInterface *tpi)
     tcg_gen_ld_i64(icount_tmp, icount_ptr, 0);
 
     /* tb_icount32 = fixup(tb->icount) */
-    /* icount_args = &tb_icount32 */
-
+    /* *META* icount_args = &tb_icount32 */
     tb_icount32 = tcg_const_i32(0);
-    icount_total_args[tpi_current_cpu_index(tpi)] = &tcg_last_op()->args[1];
+    icount_total_args[tpi_current_cpu_index(tpi)] = tcg_last_op()->args + 1;
 
     /* tb_icount64 = (int64_t)tb_icount32 */
     tb_icount64 = tcg_temp_new_i64();
@@ -85,7 +84,7 @@ static void before_gen_tb(const TCGPluginInterface *tpi)
 static void after_gen_tb(const TCGPluginInterface *tpi)
 {
     /* Patch parameter value.  */
-    *icount_total_args[tpi_current_cpu_index(tpi)] = tpi_tb_icount(tpi->tb);
+    *icount_total_args[tpi_current_cpu_index(tpi)] = tpi_tb_icount_tcgarg(tpi->tb);
 }
 
 void tpi_init(TCGPluginInterface *tpi)

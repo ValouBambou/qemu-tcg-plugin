@@ -10,6 +10,18 @@ QEMU TCG Plugins
 
 .. contents::
 
+Preliminary notes
+=================
+This TCG plugin implementation has been realised by STMicro in 2011.
+Since, a new plugin infrastructure has been implemented in QEMU. The
+fork you are in maintains the STMicro's version for compatibility
+reasons. QEMU's plugin are most of the time reffered in the source
+code as `plugin` or `tcg-plugin`, and STMicro's one as `tcg-plugin`
+or `tcg-plugin-cpp`, or even `codegen plugin`.
+If you came here looking for a reliable plugin interface, **go back
+to the mainstream QEMU**.
+Nicolas Derumigny, june 2022.
+
 
 Introduction
 ============
@@ -212,19 +224,19 @@ TCG Plugins?`_::
         const char *mode;
         size_t sizeof_CPUState;
         size_t sizeof_TranslationBlock;
-        
+
         /* Common parameters.  */
         int nb_cpus;
         FILE *output;
         uint64_t low_pc;
         uint64_t high_pc;
         bool verbose;
-        
+
         /* Parameters for non-generic plugins.  */
         bool is_generic;
         const CPUState *env;
         const TranslationBlock *tb;
-        
+
         /* Plugin's callbacks.  */
         tpi_cpus_stopped_t cpus_stopped;
         tpi_before_gen_tb_t before_gen_tb;

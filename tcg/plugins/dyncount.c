@@ -219,7 +219,7 @@ static void cpus_stopped(const TCGPluginInterface *tpi)
 
 static void update_counter(uint64_t counter_ptr, uint64_t count)
 {
-    atomic_add((uint64_t *)counter_ptr, 1);
+    qatomic_add((uint64_t *)counter_ptr, 1);
 }
 
 static void gen_update_counter(const TCGPluginInterface *tpi, uint64_t *counter_ptr)

@@ -8,6 +8,11 @@
  *
  */
 
+/*
+ * Not so fast! You might want to read the 9p developer docs first:
+ * https://wiki.qemu.org/Documentation/9p
+ */
+
 #include "qemu/osdep.h"
 
 #include "hw/9pfs/9p.h"
@@ -21,7 +26,7 @@
 
 #define VERSIONS "1"
 #define MAX_RINGS 8
-#define MAX_RING_ORDER 8
+#define MAX_RING_ORDER 9
 
 typedef struct Xen9pfsRing {
     struct Xen9pfsDev *priv;

@@ -35,11 +35,10 @@
 #include <pthread.h>     /* pthread_*(3p), */
 
 #ifdef CONFIG_USER_ONLY
-#ifndef QEMU_H
-/* Defined by linux_user/qemu.h. */
+#ifndef LINUX_USER_USER_INTERNALS_H // Avoid double declaration
 extern __thread CPUState *thread_cpu;
-#endif
-#endif
+#endif // LINUX_USER_USER_INTERNALS_H
+#endif // CONFIG_USER_ONLY
 
 extern __thread uint32_t _tpi_thread_tid;
 

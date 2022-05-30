@@ -39,7 +39,7 @@ static void pre_tb_helper_code(const TCGPluginInterface *tpi,
                                uint64_t data1, uint64_t data2,
                                const TranslationBlock* tb)
 {
-    atomic_add(&icount_total[info.cpu_index], info.icount);
+    qatomic_add(&icount_total[info.cpu_index], info.icount);
 }
 
 static void cpus_stopped(const TCGPluginInterface *tpi)

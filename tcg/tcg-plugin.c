@@ -736,14 +736,13 @@ static void tcg_plugin_tpi_init(TCGPluginInterface *tpi)
     int plugin_fd = -1;
     int plugin_instance_fd = -1;
     char *plugin_instance_path = NULL;
-    char *exec_dir;
+    const char *exec_dir = qemu_get_exec_dir();
 
     assert(tpi != NULL);
     assert(tpi->name != NULL);
 
     tcg_plugin_state_init();
 
-    exec_dir = qemu_get_exec_dir();
 
     /* Check if "name" refers to an installed/compiled plugin (short form).  */
     if (tpi->name[0] != '.' && strchr(tpi->name, '/') == NULL &&
@@ -776,7 +775,6 @@ static void tcg_plugin_tpi_init(TCGPluginInterface *tpi)
             path = NULL;
         }
     }
-    g_free(exec_dir);
 
     if (!path) {
         path = g_strdup(tpi->name);
@@ -1083,6 +1081,7 @@ static void tcg_plugin_tpi_before_gen_tb(TCGPluginInterface *tpi,
 static void tcg_plugin_tpi_after_gen_tb(TCGPluginInterface *tpi,
                                         TranslationBlock *tb)
 {
+    TPIHelperInfo tpi_hinfo;
     if (tb->pc < tpi->low_pc || tb->pc >= tpi->high_pc) {
         return;
     }
@@ -1092,14 +1091,10 @@ static void tcg_plugin_tpi_after_gen_tb(TCGPluginInterface *tpi,
 
     if (tpi->pre_tb_helper_code) {
         /* Patch helper_tcg_plugin_tb*() parameters.  */
-        ((TPIHelperInfo *)tpi->_tb_info)->cpu_index = tpi_current_cpu_index(tpi);
-        ((TPIHelperInfo *)tpi->_tb_info)->size = tb->size;
-#if TCG_TARGET_REG_BITS == 64
-        ((TPIHelperInfo *)tpi->_tb_info)->icount = tb->icount;
-#else
-        /* i64 variables use 2 arguments on 32-bit host.  */
-        *(tpi->_tb_info + 2) = tb->icount;
-#endif
+        tpi_hinfo.cpu_index = tpi_current_cpu_index(tpi);
+        tpi_hinfo.size = tb->size;
+        tpi_hinfo.icount = tb->icount;
+        *tpi->_tb_info = tcgv_i64_arg(tcg_constant_i64(tpi_hinfo._raw));
 
         /* Callback variables have to be initialized [when not used]
          * to ensure deterministic code generation, e.g. on some host
@@ -1111,21 +1106,12 @@ static void tcg_plugin_tpi_after_gen_tb(TCGPluginInterface *tpi,
 
         if (tpi->pre_tb_helper_data) {
             TPI_CALLBACK_NOT_GENERIC(tpi, pre_tb_helper_data,
-                                     *(TPIHelperInfo *)tpi->_tb_info, tb->pc,
+                                     tpi_hinfo, tb->pc,
                                      &data1, &data2, tb);
         }
 
-#if TCG_TARGET_REG_BITS == 64
-        *(uint64_t *)tpi->_tb_data1 = data1;
-        *(uint64_t *)tpi->_tb_data2 = data2;
-#else
-        /* i64 variables use 2 arguments on 32-bit host.  */
-        *tpi->_tb_data1 = data1 & 0xFFFFFFFF;
-        *(tpi->_tb_data1 + 2) = data1 >> 32;
-
-        *tpi->_tb_data2 = data2 & 0xFFFFFFFF;
-        *(tpi->_tb_data2 + 2) = data2 >> 32;
-#endif
+        *tpi->_tb_data1 = tcgv_i64_arg(tcg_constant_i64(data1));
+        *tpi->_tb_data2 = tcgv_i64_arg(tcg_constant_i64(data2));
     }
 
     if (tpi->after_gen_tb) {
@@ -1493,6 +1479,11 @@ uint32_t tpi_tb_size(const TranslationBlock *tb)
 uint32_t tpi_tb_icount(const TranslationBlock *tb)
 {
     return tb->icount;
+}
+
+TCGArg tpi_tb_icount_tcgarg(const TranslationBlock *tb)
+{
+    return tcgv_i32_arg(tcg_constant_i32(tpi_tb_icount(tb)));
 }
 
 const TranslationBlock *tpi_tb(const TCGPluginInterface *tpi)
