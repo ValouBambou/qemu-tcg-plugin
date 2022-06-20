@@ -3004,9 +3004,13 @@ static void load_elf_image(const char *image_name, int image_fd,
         info->end_data = info->end_code;
     }
 
+#ifndef CONFIG_TCG_PLUGIN
     if (qemu_log_enabled()) {
+#endif
         load_symbols(ehdr, image_fd, load_bias);
+#ifndef CONFIG_TCG_PLUGIN
     }
+#endif
 
     mmap_unlock();
 
@@ -3202,6 +3206,7 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
 #endif
     s->lookup_symbol = lookup_symbolxx;
     s->next = syminfos;
+    s->load_bias = load_bias;
     syminfos = s;
 
     return;
