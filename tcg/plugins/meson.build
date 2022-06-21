@@ -20,6 +20,36 @@ plugin_list = [
   'trace'
 ]
 
+
+if 'CONFIG_TCG_PLUGIN_CPP' in config_host
+  cpp_plugin_carg = [
+    '-Wall',
+    '-std=c++14'
+  ]
+  cpp_plugin_link_arg = []
+  cpp_plugin_src = files(
+    'cpp.c',
+    'cpp/plugin_api.cpp',
+    'cpp/count_instructions.cpp',
+    'cpp/coverage.cpp',
+    'cpp/print_dependences.cpp',
+    'cpp/print_instructions.cpp',
+    'cpp/program_profiler.cpp'
+  )
+
+  libcpp_plugin = shared_library('tcg-plugin-cpp-' + target,
+    build_by_default: true,
+    sources: cpp_plugin_src,
+    dependencies: [capstone, libelf, libdwarf],
+    c_args: plugin_carg + c_args,
+    cpp_args: cpp_plugin_carg,
+    link_args : plugin_link_arg + cpp_plugin_link_arg,
+    include_directories: target_inc,
+    install: true,
+    install_dir: plugin_install_dir
+  )
+endif
+
 subdir('d4-7')
 dinero_plugin_src = files(
  'dineroIV.c'

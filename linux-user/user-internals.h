@@ -57,6 +57,8 @@ extern IOCTLEntry ioctl_entries[];
  */
 int info_is_fdpic(struct image_info *info);
 
+void load_symbols_from_fd(int fd, abi_ulong load_bias);
+
 void target_set_brk(abi_ulong new_brk);
 void syscall_init(void);
 abi_long do_syscall(void *cpu_env, int num, abi_long arg1,

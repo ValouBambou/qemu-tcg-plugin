@@ -22,9 +22,50 @@
 #include "qemu.h"
 #include "user-internals.h"
 #include "user-mmap.h"
+#include "tcg/tcg-plugin.h"
 
 static pthread_mutex_t mmap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static __thread int mmap_lock_count;
+
+/* keep track of files mapped */
+struct mapinfo {
+    const char *filename;
+    uint64_t addr;
+    size_t length;
+    struct mapinfo *next;
+};
+struct mapinfo *mapinfos = NULL;
+
+bool get_mapped_file(uint64_t addr, const char** name, uint64_t* base_addr)
+{
+    struct mapinfo *it;
+    for (it = mapinfos; it != NULL; it = it->next)
+    {
+        if (addr >= it->addr && addr < it->addr + it->length)
+        {
+            *name = it->filename;
+            *base_addr = it->addr;
+        }
+    }
+    return NULL;
+}
+
+void add_mapinfo(const char* filename, uint64_t addr, size_t length)
+{
+    struct mapinfo *info = g_new(struct mapinfo, 1);
+    info->filename = g_strdup(filename);
+    info->addr = addr;
+    info->length = length;
+    info->next = mapinfos;
+    mapinfos = info;
+    /*
+    fprintf(stderr, "New mapping %s at 0x%" PRIx64 ", length %lu, end 0x%" PRIx64 "\n",
+            mapinfos->filename,
+            mapinfos->addr,
+            mapinfos->length,
+            addr + length - 1);
+    */
+}
 
 void mmap_lock(void)
 {
@@ -628,6 +669,18 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int target_prot,
     page_flags |= PAGE_RESET;
     page_set_flags(start, start + len, page_flags);
  the_end:
+    if ((target_prot & PROT_EXEC) && (qemu_log_enabled() || tcg_plugin_enabled())) {
+        assert(start >= offset);
+        load_symbols_from_fd(fd, start - offset);
+    }
+    char proc_fd[PATH_MAX];
+    char filename[PATH_MAX];
+    memset(proc_fd, 0, PATH_MAX);
+    memset(filename, 0, PATH_MAX);
+    snprintf(proc_fd, PATH_MAX, "/proc/self/fd/%d", fd);
+    if (readlink(proc_fd, filename, PATH_MAX) != -1)
+        add_mapinfo(filename, start, len);
+
     trace_target_mmap_complete(start);
     if (qemu_loglevel_mask(CPU_LOG_PAGE)) {
         log_page_dump(__func__);

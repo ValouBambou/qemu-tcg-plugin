@@ -3378,6 +3378,41 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
     return 0;
 }
 
+/* Load the symbols of the object ``fd`` dynamic loaded at the address
+ * ``load_bias``.  */
+void load_symbols_from_fd(int fd, abi_ulong load_bias)
+{
+    char path[PATH_MAX];
+    char proc_fd[PATH_MAX];
+    ssize_t status;
+    struct elfhdr ehdr;
+
+    status = snprintf(proc_fd, PATH_MAX, "/proc/self/fd/%d", fd);
+    if (status < 0 || status >= PATH_MAX) {
+        return;
+    }
+
+    status = readlink(proc_fd, path, PATH_MAX);
+    if (status < 0 || status >= PATH_MAX) {
+        return;
+    }
+    path[status] = '\0';
+    status = pread(fd, &ehdr, sizeof(struct elfhdr), 0);
+    if (status < 0) {
+        return;
+    }
+
+    if (!elf_check_ident(&ehdr)) {
+        return;
+    }
+    bswap_ehdr(&ehdr);
+    if (!elf_check_ehdr(&ehdr)) {
+        return;
+    }
+
+    load_symbols(&ehdr, fd, ehdr.e_type == ET_EXEC ? 0 : load_bias);
+}
+
 #ifdef USE_ELF_CORE_DUMP
 /*
  * Definitions to generate Intel SVR4-like core files.

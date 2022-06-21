@@ -6,7 +6,7 @@
 #include "cpp/plugin_instrumentation_api.h"
 
 #ifdef CONFIG_USER_ONLY
-/* defined in linux-user/qemu.h */
+/* defined in linux-user/user-mmap.h */
 extern bool get_mapped_file(uint64_t addr, const char** name,
                             uint64_t* base_addr);
 #else
@@ -87,7 +87,7 @@ static void on_store(translation_block** b_ptr, uint64_t pc, uint64_t addr,
 }
 
 // returns size (in bytes) of memory affected by operation
-static uint32_t memory_op_size(TCGMemOp memflags)
+static uint32_t memory_op_size(MemOp memflags)
 {
     switch (memflags & MO_SIZE) {
     case MO_8:
@@ -125,8 +125,8 @@ static void after_gen_opc(const TCGPluginInterface* tpi, const TPIOpCode* op)
         return;
     }
 
-    const TCGMemOpIdx flags = op->opargs[2];
-    const TCGMemOp memflags = get_memop(flags);
+    const MemOpIdx flags = op->opargs[2];
+    const MemOp memflags = get_memop(flags);
     uint32_t memory_size = memory_op_size(memflags);
 
     TCGv_ptr t_block = tcg_const_ptr(current_block_ptr);

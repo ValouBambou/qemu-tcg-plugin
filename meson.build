@@ -2290,6 +2290,14 @@ genh += custom_target('config-poison.h',
 ##############
 # Submodules #
 ##############
+libelf = not_found
+libdwarf = not_found
+if 'CONFIG_TCG_PLUGIN_CPP' in config_host
+  # Using a directory instead the dubmodule directly to avoid
+  # setting "." as include directory when linking with `libelf`
+  # (as libelf has no `include` subdir).
+  subdir('libelfin')
+endif
 
 capstone = not_found
 capstone_opt = get_option('capstone')
