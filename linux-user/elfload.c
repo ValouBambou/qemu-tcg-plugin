@@ -1786,7 +1786,7 @@ static inline void bswap_mips_abiflags(Mips_elf_abiflags_v0 *abiflags) { }
 #ifdef USE_ELF_CORE_DUMP
 static int elf_core_dump(int, const CPUArchState *);
 #endif /* USE_ELF_CORE_DUMP */
-static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias);
+static void load_symbols(struct elfhdr *hdr, int fd, const char *filename, abi_ulong load_bias);
 
 /* Verify the portions of EHDR within E_IDENT for the target.
    This can be performed before bswapping the entire header.  */
@@ -3007,7 +3007,7 @@ static void load_elf_image(const char *image_name, int image_fd,
 #ifndef CONFIG_TCG_PLUGIN
     if (qemu_log_enabled()) {
 #endif
-        load_symbols(ehdr, image_fd, load_bias);
+        load_symbols(ehdr, image_fd, image_name, load_bias);
 #ifndef CONFIG_TCG_PLUGIN
     }
 #endif
@@ -3107,7 +3107,7 @@ static int symcmp(const void *s0, const void *s1)
 }
 
 /* Best attempt to load symbols from this ELF object. */
-static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
+static void load_symbols(struct elfhdr *hdr, int fd, const char *filename, abi_ulong load_bias)
 {
     int i, shnum, nsyms, sym_idx = 0, str_idx = 0;
     uint64_t segsz;
@@ -3205,6 +3205,7 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
     s->disas_symtab.elf64 = syms;
 #endif
     s->lookup_symbol = lookup_symbolxx;
+    s->filename = g_strdup(filename);
     s->next = syminfos;
     s->load_bias = load_bias;
     syminfos = s;
@@ -3410,7 +3411,7 @@ void load_symbols_from_fd(int fd, abi_ulong load_bias)
         return;
     }
 
-    load_symbols(&ehdr, fd, ehdr.e_type == ET_EXEC ? 0 : load_bias);
+    load_symbols(&ehdr, fd, path, ehdr.e_type == ET_EXEC ? 0 : load_bias);
 }
 
 #ifdef USE_ELF_CORE_DUMP
