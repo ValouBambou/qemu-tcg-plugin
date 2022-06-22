@@ -40,6 +40,7 @@
 #include "exec/gdbstub.h"
 #ifdef CONFIG_USER_ONLY
 #include "qemu.h"
+#include "qemu-common.h"
 
 #define COMMON_SEMI_HEAP_SIZE (128 * 1024 * 1024)
 #else
@@ -988,7 +989,8 @@ target_ulong do_common_semihosting(CPUState *cs)
         return guestfd_fns[gf->type].flenfn(cs, gf);
     case TARGET_SYS_TMPNAM:
         GET_ARG(0);
-
+        GET_ARG(1);
+        GET_ARG(2);
         if (asprintf(&s, "/tmp/qemu-%x%02x", getpid(),
                      (int) (arg1 & 0xff)) < 0) {
             return -1;
@@ -1000,15 +1002,15 @@ target_ulong do_common_semihosting(CPUState *cs)
             char *output = lock_user(VERIFY_WRITE, arg0, arg2, 0);
             strcpy(output, s);
             unlock_user(output, arg0, arg2);
-            ul_ret = 0;c
+            ul_ret = 0;
         }
         free(s);
-        TARGET_SYS_CLOSEcturn ul_ret;
+        return ul_ret;
     case TARGET_SYS_REMOVE:
         GET_ARG(0);
-        GcET_ARG(1);
+        GET_ARG(1);
         if (use_gdb_syscalls()) {
-        c    ret = common_semi_gdb_syscall(cs, common_semi_cb, "unlink,%s",
+            ret = common_semi_gdb_syscall(cs, common_semi_cb, "unlink,%s",
                                           arg0, (int)arg1 + 1);
         } else {
             s = lock_user_string(arg0);
@@ -1049,7 +1051,7 @@ target_ulong do_common_semihosting(CPUState *cs)
         /* Number of centiseconds since execution started.  */
         if (clock_ifetch) {
             assert(count_ifetch);
-            return ENV_GET_CPU(env)->ifetch_counter / (clock_ifetch / 100);
+            return cs->ifetch_counter / (clock_ifetch / 100);
         } else {
             return clock() / (CLOCKS_PER_SEC / 100);
         }

@@ -3251,7 +3251,79 @@ foreach target : target_dirs
                  name_suffix: 'fa')
 
   # Looks link plugins are target-specific as they need `tcg-plugin.h` which needs `cpu.h`
-  subdir('tcg/plugins')
+  if 'CONFIG_TCG_PLUGIN_CPP' in config_host
+    libcpp_plugin = shared_library('tcg-plugin-cpp-' + target,
+      build_by_default: true,
+      sources: tcg_cpp_plugin_src,
+      dependencies: [capstone, libelf, libdwarf],
+      c_args: tcg_plugin_carg + c_args,
+      cpp_args: tcg_cpp_plugin_carg,
+      link_args : tcg_plugin_link_arg + tcg_cpp_plugin_link_arg,
+      include_directories: target_inc,
+      install: true,
+      install_dir: tcg_plugin_install_dir
+    )
+  endif
+
+  libdinero_plugin = shared_library('tcg-plugin-dineroIV-' + target,
+    build_by_default: true,
+    sources: dinero_plugin_src,
+    link_with: libdinero,
+    c_args: tcg_plugin_carg + c_args,
+    link_args : tcg_plugin_link_arg,
+    include_directories: ['tcg/plugins/d4-7'] + target_inc,
+    install: true,
+    install_dir: tcg_plugin_install_dir
+  )
+
+  libdyncount_plugin = shared_library('tcg-plugin-dyncount-' + target,
+    build_by_default: true,
+    sources: dyncount_plugin_src,
+    dependencies: capstone,
+    c_args: tcg_plugin_carg + c_args,
+    link_args : tcg_plugin_link_arg,
+    include_directories: target_inc,
+    install: true,
+    install_dir: tcg_plugin_install_dir
+  )
+
+  libdyntrace_plugin = shared_library('tcg-plugin-dyntrace-' + target,
+    build_by_default: true,
+    sources: dyntrace_plugin_src,
+    dependencies: capstone,
+    c_args: tcg_plugin_carg + c_args,
+    link_args : tcg_plugin_link_arg,
+    include_directories: target_inc,
+    install: true,
+    install_dir: tcg_plugin_install_dir
+  )
+
+  libcoverage_plugin = shared_library('tcg-plugin-coverage-' + target,
+    build_by_default: true,
+    sources: coverage_plugin_src,
+    dependencies: capstone,
+    c_args: tcg_plugin_carg + c_args,
+    link_args : tcg_plugin_link_arg,
+    include_directories: target_inc,
+    install: true,
+    install_dir: tcg_plugin_install_dir
+  )
+
+  foreach pl: tcg_plugin_list
+    tcg_plugin_src = files(
+      'tcg/plugins/' + pl + '.c'
+    )
+
+    lib_plugin = shared_library('tcg-plugin-' + pl + '-' + target,
+      build_by_default: true,
+      sources: tcg_plugin_src,
+      c_args: tcg_plugin_carg + c_args,
+      link_args : tcg_plugin_link_arg,
+      include_directories: target_inc,
+      install: true,
+      install_dir: tcg_plugin_install_dir
+    )
+  endforeach
 
   if target.endswith('-softmmu')
     execs = [{

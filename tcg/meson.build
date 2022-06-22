@@ -23,3 +23,7 @@ endif
 specific_ss.add_all(when: 'CONFIG_TCG', if_true: tcg_ss)
 specific_ss.add_all(when: 'CONFIG_TCG_PLUGIN', if_true: tcg_plugin_ss)
 specific_ss.add_all(when: 'CONFIG_TCG_PLUGIN_CPP', if_true: tcg_plugin_ss)
+
+if 'CONFIG_TCG_PLUGIN' in config_host
+  subdir('plugins')
+endif

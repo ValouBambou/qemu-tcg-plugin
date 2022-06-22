@@ -171,7 +171,8 @@ static void after_gen_opc(const TCGPluginInterface *tpi, const TPIOpCode *tpi_op
 #if defined(TARGET_SH4)
         MEMACCESS('i', 2);
 #elif defined(TARGET_ARM)
-        MEMACCESS('i', ARM_TBFLAG_THUMB(tpi->tb->flags) ? 2 : 4);
+        CPUARMTBFlags tb_flags = (CPUARMTBFlags){ tpi->tb->flags, tpi->tb->cs_base };
+        MEMACCESS('i', EX_TBFLAG_AM32(tb_flags, THUMB) ? 2 : 4);
 #else
         MEMACCESS('i', 4); /* Assume 4 bytes, even for variable length encoding. */
 #endif
