@@ -621,6 +621,7 @@ endif
 spice_headers = spice.partial_dependency(compile_args: true, includes: true)
 
 rt = cc.find_library('rt', required: false)
+dl = cc.find_library('libdl', required: config_host.has_key('CONFIG_TCG_PLUGIN'))
 
 libiscsi = not_found
 if not get_option('libiscsi').auto() or have_block
@@ -3366,7 +3367,7 @@ foreach target : target_dirs
     emulator = executable(exe_name, exe['sources'],
                install: true,
                c_args: c_args,
-               dependencies: arch_deps + deps + exe['dependencies'],
+               dependencies: arch_deps + deps + exe['dependencies'] + dl,
                objects: lib.extract_all_objects(recursive: true),
                link_language: link_language,
                link_depends: [block_syms, qemu_syms] + exe.get('link_depends', []),
