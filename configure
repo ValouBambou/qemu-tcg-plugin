@@ -4082,6 +4082,20 @@ if compile_prog "" "" ; then
   accept4=yes
 fi
 
+# check if gettid is there
+gettid=no
+cat > $TMPC << EOF
+#include <sys/types.h>
+extern pid_t gettid();
+int main(void)
+{
+    return gettid();
+}
+EOF
+if compile_prog "" "" ; then
+  gettid=yes
+fi
+
 # check if tee/splice is there. vmsplice was added same time.
 splice=no
 cat > $TMPC << EOF
@@ -6386,6 +6400,9 @@ if test "$pipe2" = "yes" ; then
 fi
 if test "$accept4" = "yes" ; then
   echo "CONFIG_ACCEPT4=y" >> $config_host_mak
+fi
+if test "$gettid" = "yes" ; then
+  echo "CONFIG_GETTID=y" >> $config_host_mak
 fi
 if test "$splice" = "yes" ; then
   echo "CONFIG_SPLICE=y" >> $config_host_mak

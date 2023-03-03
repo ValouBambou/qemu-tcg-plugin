@@ -252,6 +252,7 @@ static type name (type1 arg1,type2 arg2,type3 arg3,type4 arg4,type5 arg5,	\
 #define TARGET_NR__llseek TARGET_NR_llseek
 #endif
 
+#if !defined(CONFIG_GETTID)
 #ifdef __NR_gettid
 _syscall0(int, gettid)
 #else
@@ -260,6 +261,7 @@ _syscall0(int, gettid)
 static int gettid(void) {
     return -ENOSYS;
 }
+#endif
 #endif
 
 /* For the 64-bit guest on 32-bit host case we must emulate
