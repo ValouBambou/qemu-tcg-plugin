@@ -202,6 +202,12 @@ typedef void (*tpi_active_changed_t)(bool new_state);
 
 #define TPI_VERSION 9
 
+#if defined(CONFIG_USER_ONLY)
+#define TPI_EMULATION_MODE "user"
+#else
+#define TPI_EMULATION_MODE "system"
+#endif
+
 struct TCGPluginInterface {
     /* Compatibility information.  */
     int32_t version;
@@ -272,7 +278,7 @@ struct TCGPluginInterface {
 #define TPI_INIT_VERSION(tpi) do {                                     \
         (tpi)->version = TPI_VERSION;                                   \
         (tpi)->guest   = TARGET_NAME;                                   \
-        (tpi)->mode    = EMULATION_MODE;                                \
+        (tpi)->mode    = TPI_EMULATION_MODE;                            \
         (tpi)->sizeof_CPUState = sizeof(CPUState);                      \
         (tpi)->sizeof_TranslationBlock = sizeof(TranslationBlock);      \
         (tpi)->sizeof_TCGContext = sizeof(TCGContext);                  \

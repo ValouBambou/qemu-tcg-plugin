@@ -743,7 +743,6 @@ static void tcg_plugin_tpi_init(TCGPluginInterface *tpi)
 
     tcg_plugin_state_init();
 
-
     /* Check if "name" refers to an installed/compiled plugin (short form).  */
     if (tpi->name[0] != '.' && strchr(tpi->name, '/') == NULL &&
         exec_dir != NULL && exec_dir[0] == '/') {
@@ -753,7 +752,7 @@ static void tcg_plugin_tpi_init(TCGPluginInterface *tpi)
 
         /* look for installed plugin */
         prefix = dirname(g_strdup(exec_dir));
-        format = "%s/libexec/" TARGET_NAME "/" EMULATION_MODE "/tcg-plugin-%s.so";
+        format = "%s/libexec/" TARGET_NAME "/" TPI_EMULATION_MODE "/libtcg-plugin-%s.so";
         size = strlen(format) + strlen(prefix) - strlen("%s") +
             strlen(tpi->name) - strlen("%s") + 1;
         path = g_malloc0(size * sizeof(char));
@@ -927,10 +926,10 @@ static void tcg_plugin_tpi_init(TCGPluginInterface *tpi)
                 "(%s != %s)\n", tpi->guest, TARGET_NAME);
     }
 
-    if (strcmp(tpi->mode, EMULATION_MODE) != 0
+    if (strcmp(tpi->mode, TPI_EMULATION_MODE) != 0
         && strcmp(tpi->mode, "any") != 0) {
         fprintf(stderr, "plugin: warning: incompatible emulation mode "
-                "(%s != %s)\n", tpi->mode, EMULATION_MODE);
+                "(%s != %s)\n", tpi->mode, TPI_EMULATION_MODE);
     }
 
     tpi->is_generic = strcmp(tpi->guest, "any") == 0 &&

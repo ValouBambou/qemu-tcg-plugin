@@ -987,6 +987,7 @@ int main(int argc, char **argv, char **envp)
     initialize_ifetch();
     /* initialize plugins to allow tpi_init to be called.
      * Allows plugin to declare their parameters. */
+    qemu_init_exec_dir(argv[0]);
     tcg_plugin_initialize_all();
 
     if (gdbstub) {

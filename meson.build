@@ -3253,7 +3253,7 @@ foreach target : target_dirs
 
   # Looks link plugins are target-specific as they need `tcg-plugin.h` which needs `cpu.h`
   if 'CONFIG_TCG_PLUGIN_CPP' in config_host
-    libcpp_plugin = shared_library('tcg-plugin-cpp-' + target,
+    libcpp_plugin = shared_library('tcg-plugin-cpp',
       build_by_default: true,
       sources: tcg_cpp_plugin_src,
       dependencies: [capstone, libelf, libdwarf],
@@ -3262,11 +3262,11 @@ foreach target : target_dirs
       link_args : tcg_plugin_link_arg + tcg_cpp_plugin_link_arg,
       include_directories: target_inc,
       install: true,
-      install_dir: tcg_plugin_install_dir
+      install_dir: tcg_plugin_install_dir / target_name / target_type
     )
   endif
 
-  libdinero_plugin = shared_library('tcg-plugin-dineroIV-' + target,
+  libdinero_plugin = shared_library('tcg-plugin-dineroIV',
     build_by_default: true,
     sources: dinero_plugin_src,
     link_with: libdinero,
@@ -3274,10 +3274,10 @@ foreach target : target_dirs
     link_args : tcg_plugin_link_arg,
     include_directories: ['tcg/plugins/d4-7'] + target_inc,
     install: true,
-    install_dir: tcg_plugin_install_dir
+    install_dir: tcg_plugin_install_dir / target_name / target_type
   )
 
-  libdyncount_plugin = shared_library('tcg-plugin-dyncount-' + target,
+  libdyncount_plugin = shared_library('tcg-plugin-dyncount',
     build_by_default: true,
     sources: dyncount_plugin_src,
     dependencies: capstone,
@@ -3285,10 +3285,10 @@ foreach target : target_dirs
     link_args : tcg_plugin_link_arg,
     include_directories: target_inc,
     install: true,
-    install_dir: tcg_plugin_install_dir
+    install_dir: tcg_plugin_install_dir / target_name / target_type
   )
 
-  libdyntrace_plugin = shared_library('tcg-plugin-dyntrace-' + target,
+  libdyntrace_plugin = shared_library('tcg-plugin-dyntrace',
     build_by_default: true,
     sources: dyntrace_plugin_src,
     dependencies: capstone,
@@ -3296,10 +3296,10 @@ foreach target : target_dirs
     link_args : tcg_plugin_link_arg,
     include_directories: target_inc,
     install: true,
-    install_dir: tcg_plugin_install_dir
+    install_dir: tcg_plugin_install_dir / target_name / target_type
   )
 
-  libcoverage_plugin = shared_library('tcg-plugin-coverage-' + target,
+  libcoverage_plugin = shared_library('tcg-plugin-coverage',
     build_by_default: true,
     sources: coverage_plugin_src,
     dependencies: capstone,
@@ -3307,7 +3307,7 @@ foreach target : target_dirs
     link_args : tcg_plugin_link_arg,
     include_directories: target_inc,
     install: true,
-    install_dir: tcg_plugin_install_dir
+    install_dir: tcg_plugin_install_dir / target_name / target_type
   )
 
   foreach pl: tcg_plugin_list
@@ -3315,14 +3315,14 @@ foreach target : target_dirs
       'tcg/plugins/' + pl + '.c'
     )
 
-    lib_plugin = shared_library('tcg-plugin-' + pl + '-' + target,
+    lib_plugin = shared_library('tcg-plugin-' + pl,
       build_by_default: true,
       sources: tcg_plugin_src,
       c_args: tcg_plugin_carg + c_args,
       link_args : tcg_plugin_link_arg,
       include_directories: target_inc,
       install: true,
-      install_dir: tcg_plugin_install_dir
+      install_dir: tcg_plugin_install_dir / target_name / target_type
     )
   endforeach
 

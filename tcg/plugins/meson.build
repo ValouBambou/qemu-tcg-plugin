@@ -7,7 +7,7 @@ tcg_plugin_link_arg = [
                   # libraries, which is needed for the plugin interface
 ]
 
-tcg_plugin_install_dir = 'usr/lib'
+tcg_plugin_install_dir = 'libexec'
 
 tcg_plugin_list = [
   'ftrace',
