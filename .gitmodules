@@ -69,4 +69,4 @@
 	url = https://gitlab.com/libvirt/libvirt-ci.git
 [submodule "libelfin/libelfin"]
 	path = libelfin/libelfin
-	url = git@github.com:aclements/libelfin.git
+	url = https://github.com/aclements/libelfin.git
