@@ -31,10 +31,10 @@
 #include <inttypes.h>
 #include <unistd.h>
 
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 #include "disas/disas.h"
 
-/* glib must be included after osdep.h (which we include transitively via tcg-plugin.h) */
+/* glib must be included after osdep.h (which we include transitively via tcg/tcg-plugin.h) */
 #include <glib.h>
 
 #ifdef CONFIG_CAPSTONE
@@ -134,11 +134,13 @@ static csh get_cs_handle(const TCGPluginInterface *tpi)
     csh cs_handle = cs_handles[0];
 
 #if defined(TARGET_ARM) || defined(TARGET_AARCH64)
-    if (ARM_TBFLAG_THUMB(tpi_tb(tpi)->flags)) {
+    // This may not work if the target block changes the CPU mode
+    if (tpi->tcg_ctx->cpu->env_ptr->thumb) {
         cs_handle = cs_handles[1];
     }
 #if defined(TARGET_AARCH64)
-    if (ARM_TBFLAG_AARCH64_STATE(tpi_tb(tpi)->flags)) {
+    // This may not work if the target block changes the CPU mode
+    if (tpi->tcg_ctx->cpu->env_ptr->aarch64) {
         cs_handle = cs_handles[2];
     }
 #endif
@@ -219,7 +221,7 @@ static void cpus_stopped(const TCGPluginInterface *tpi)
 
 static void update_counter(uint64_t counter_ptr, uint64_t count)
 {
-    atomic_add((uint64_t *)counter_ptr, 1);
+    qatomic_add((uint64_t *)counter_ptr, 1);
 }
 
 static void gen_update_counter(const TCGPluginInterface *tpi, uint64_t *counter_ptr)

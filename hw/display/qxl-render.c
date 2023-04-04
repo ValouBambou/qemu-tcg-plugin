@@ -21,6 +21,7 @@
 
 #include "qemu/osdep.h"
 #include "qxl.h"
+#include "sysemu/runstate.h"
 #include "trace.h"
 
 static void qxl_blit(PCIQXLDevice *qxl, QXLRect *rect)
@@ -108,7 +109,7 @@ static void qxl_render_update_area_unlocked(PCIQXLDevice *qxl)
                                                 qxl->guest_primary.surface.mem,
                                                 MEMSLOT_GROUP_GUEST);
         if (!qxl->guest_primary.data) {
-            return;
+            goto end;
         }
         qxl_set_rect_to_surface(qxl, &qxl->dirty[0]);
         qxl->num_dirty_rects = 1;
@@ -136,7 +137,7 @@ static void qxl_render_update_area_unlocked(PCIQXLDevice *qxl)
     }
 
     if (!qxl->guest_primary.data) {
-        return;
+        goto end;
     }
     for (i = 0; i < qxl->num_dirty_rects; i++) {
         if (qemu_spice_rect_is_empty(qxl->dirty+i)) {
@@ -157,6 +158,11 @@ static void qxl_render_update_area_unlocked(PCIQXLDevice *qxl)
                        qxl->dirty[i].bottom - qxl->dirty[i].top);
     }
     qxl->num_dirty_rects = 0;
+
+end:
+    if (qxl->render_update_cookie_num == 0) {
+        graphic_hw_update_done(qxl->ssd.dcl.con);
+    }
 }
 
 /*
@@ -175,6 +181,7 @@ void qxl_render_update(PCIQXLDevice *qxl)
         qxl->mode == QXL_MODE_UNDEFINED) {
         qxl_render_update_area_unlocked(qxl);
         qemu_mutex_unlock(&qxl->ssd.lock);
+        graphic_hw_update_done(qxl->ssd.dcl.con);
         return;
     }
 
@@ -240,6 +247,13 @@ static QEMUCursor *qxl_cursor(PCIQXLDevice *qxl, QXLCursor *cursor,
     size_t size;
 
     c = cursor_alloc(cursor->header.width, cursor->header.height);
+
+    if (!c) {
+        qxl_set_guest_bug(qxl, "%s: cursor %ux%u alloc error", __func__,
+                cursor->header.width, cursor->header.height);
+        goto fail;
+    }
+
     c->hot_x = cursor->header.hot_spot_x;
     c->hot_y = cursor->header.hot_spot_y;
     switch (cursor->header.type) {
@@ -259,7 +273,7 @@ static QEMUCursor *qxl_cursor(PCIQXLDevice *qxl, QXLCursor *cursor,
         }
         break;
     case SPICE_CURSOR_TYPE_ALPHA:
-        size = sizeof(uint32_t) * cursor->header.width * cursor->header.height;
+        size = sizeof(uint32_t) * c->width * c->height;
         qxl_unpack_chunks(c->data, size, qxl, &cursor->chunk, group_id);
         if (qxl->debug > 2) {
             cursor_print_ascii_art(c, "qxl/alpha");

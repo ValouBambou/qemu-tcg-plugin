@@ -26,13 +26,13 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-run-state.h"
 #include "qapi/qapi-events-run-state.h"
-#include "sysemu/sysemu.h"
+#include "sysemu/runstate.h"
 #include "sysemu/watchdog.h"
 #include "hw/nmi.h"
 #include "qemu/help_option.h"
 
 static WatchdogAction watchdog_action = WATCHDOG_ACTION_RESET;
-static QLIST_HEAD(watchdog_list, WatchdogTimerModel) watchdog_list;
+static QLIST_HEAD(, WatchdogTimerModel) watchdog_list;
 
 void watchdog_add_model(WatchdogTimerModel *model)
 {
@@ -74,20 +74,6 @@ int select_watchdog(const char *p)
                  model->wdt_name, model->wdt_description);
     }
     return 1;
-}
-
-int select_watchdog_action(const char *p)
-{
-    int action;
-    char *qapi_value;
-
-    qapi_value = g_ascii_strdown(p, -1);
-    action = qapi_enum_parse(&WatchdogAction_lookup, qapi_value, -1, NULL);
-    g_free(qapi_value);
-    if (action < 0)
-        return -1;
-    qmp_watchdog_set_action(action, &error_abort);
-    return 0;
 }
 
 WatchdogAction get_watchdog_action(void)

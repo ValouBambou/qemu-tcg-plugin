@@ -1,5 +1,5 @@
 /*
- * ARM Generic Interrupt Controller v3
+ * ARM Generic Interrupt Controller v3 (emulation)
  *
  * Copyright (c) 2016 Linaro Limited
  * Written by Peter Maydell
@@ -14,18 +14,12 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bitops.h"
+#include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "trace.h"
 #include "gicv3_internal.h"
+#include "hw/irq.h"
 #include "cpu.h"
-
-void gicv3_set_gicv3state(CPUState *cpu, GICv3CPUState *s)
-{
-    ARMCPU *arm_cpu = ARM_CPU(cpu);
-    CPUARMState *env = &arm_cpu->env;
-
-    env->gicv3state = (void *)s;
-};
 
 static GICv3CPUState *icc_cs_from_env(CPUARMState *env)
 {
@@ -85,8 +79,8 @@ static bool icv_access(CPUARMState *env, int hcr_flags)
      *  * access if NS EL1 and either IMO or FMO == 1:
      *    CTLR, DIR, PMR, RPR
      */
-    bool flagmatch = ((hcr_flags & HCR_IMO) && arm_hcr_el2_imo(env)) ||
-        ((hcr_flags & HCR_FMO) && arm_hcr_el2_fmo(env));
+    uint64_t hcr_el2 = arm_hcr_el2_eff(env);
+    bool flagmatch = hcr_el2 & hcr_flags & (HCR_IMO | HCR_FMO);
 
     return flagmatch && arm_current_el(env) == 1
         && !arm_is_secure_below_el3(env);
@@ -349,7 +343,8 @@ static uint32_t maintenance_interrupt_state(GICv3CPUState *cs)
     /* Scan list registers and fill in the U, NP and EOI bits */
     eoi_maintenance_interrupt_state(cs, &value);
 
-    if (cs->ich_hcr_el2 & (ICH_HCR_EL2_LRENPIE | ICH_HCR_EL2_EOICOUNT_MASK)) {
+    if ((cs->ich_hcr_el2 & ICH_HCR_EL2_LRENPIE) &&
+        (cs->ich_hcr_el2 & ICH_HCR_EL2_EOICOUNT_MASK)) {
         value |= ICH_MISR_EL2_LRENP;
     }
 
@@ -398,6 +393,7 @@ static void gicv3_cpuif_virt_update(GICv3CPUState *cs)
     int irqlevel = 0;
     int fiqlevel = 0;
     int maintlevel = 0;
+    ARMCPU *cpu = ARM_CPU(cs->cpu);
 
     idx = hppvi_index(cs);
     trace_gicv3_cpuif_virt_update(gicv3_redist_affid(cs), idx);
@@ -414,8 +410,9 @@ static void gicv3_cpuif_virt_update(GICv3CPUState *cs)
         }
     }
 
-    if (cs->ich_hcr_el2 & ICH_HCR_EL2_EN) {
-        maintlevel = maintenance_interrupt_state(cs);
+    if ((cs->ich_hcr_el2 & ICH_HCR_EL2_EN) &&
+        maintenance_interrupt_state(cs) != 0) {
+        maintlevel = 1;
     }
 
     trace_gicv3_cpuif_virt_set_irqs(gicv3_redist_affid(cs), fiqlevel,
@@ -423,7 +420,7 @@ static void gicv3_cpuif_virt_update(GICv3CPUState *cs)
 
     qemu_set_irq(cs->parent_vfiq, fiqlevel);
     qemu_set_irq(cs->parent_virq, irqlevel);
-    qemu_set_irq(cs->maintenance_irq, maintlevel);
+    qemu_set_irq(cpu->gicv3_maintenance_interrupt, maintlevel);
 }
 
 static uint64_t icv_ap_read(CPUARMState *env, const ARMCPRegInfo *ri)
@@ -615,7 +612,8 @@ static uint64_t icv_hppir_read(CPUARMState *env, const ARMCPRegInfo *ri)
         }
     }
 
-    trace_gicv3_icv_hppir_read(grp, gicv3_redist_affid(cs), value);
+    trace_gicv3_icv_hppir_read(ri->crm == 8 ? 0 : 1,
+                               gicv3_redist_affid(cs), value);
     return value;
 }
 
@@ -649,7 +647,7 @@ static uint64_t icv_iar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 
         if (thisgrp == grp && icv_hppi_can_preempt(cs, lr)) {
             intid = ich_lr_vintid(lr);
-            if (intid < INTID_SECURE) {
+            if (!gicv3_intid_is_special(intid)) {
                 icv_activate_irq(cs, idx, grp);
             } else {
                 /* Interrupt goes from Pending to Invalid */
@@ -663,6 +661,9 @@ static uint64_t icv_iar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 
     trace_gicv3_icv_iar_read(ri->crm == 8 ? 0 : 1,
                              gicv3_redist_affid(cs), intid);
+
+    gicv3_cpuif_virt_update(cs);
+
     return intid;
 }
 
@@ -893,10 +894,12 @@ static void icc_activate_irq(GICv3CPUState *cs, int irq)
         cs->gicr_iactiver0 = deposit32(cs->gicr_iactiver0, irq, 1, 1);
         cs->gicr_ipendr0 = deposit32(cs->gicr_ipendr0, irq, 1, 0);
         gicv3_redist_update(cs);
-    } else {
+    } else if (irq < GICV3_LPI_INTID_START) {
         gicv3_gicd_active_set(cs->gic, irq);
         gicv3_gicd_pending_clear(cs->gic, irq);
         gicv3_update(cs->gic, irq, 1);
+    } else {
+        gicv3_redist_lpi_pending(cs, irq, 0);
     }
 }
 
@@ -988,7 +991,7 @@ static uint64_t icc_iar0_read(CPUARMState *env, const ARMCPRegInfo *ri)
         intid = icc_hppir0_value(cs, env);
     }
 
-    if (!(intid >= INTID_SECURE && intid <= INTID_SPURIOUS)) {
+    if (!gicv3_intid_is_special(intid)) {
         icc_activate_irq(cs, intid);
     }
 
@@ -1011,7 +1014,7 @@ static uint64_t icc_iar1_read(CPUARMState *env, const ARMCPRegInfo *ri)
         intid = icc_hppir1_value(cs, env);
     }
 
-    if (!(intid >= INTID_SECURE && intid <= INTID_SPURIOUS)) {
+    if (!gicv3_intid_is_special(intid)) {
         icc_activate_irq(cs, intid);
     }
 
@@ -1221,7 +1224,7 @@ static void icv_dir_write(CPUARMState *env, const ARMCPRegInfo *ri,
 
     trace_gicv3_icv_dir_write(gicv3_redist_affid(cs), value);
 
-    if (irq >= cs->gic->num_irq) {
+    if (irq >= GICV3_MAXIRQ) {
         /* Also catches special interrupt numbers and LPIs */
         return;
     }
@@ -1256,8 +1259,7 @@ static void icv_eoir_write(CPUARMState *env, const ARMCPRegInfo *ri,
     trace_gicv3_icv_eoir_write(ri->crm == 8 ? 0 : 1,
                                gicv3_redist_affid(cs), value);
 
-    if (irq >= cs->gic->num_irq) {
-        /* Also catches special interrupt numbers and LPIs */
+    if (gicv3_intid_is_special(irq)) {
         return;
     }
 
@@ -1302,28 +1304,18 @@ static void icc_eoir_write(CPUARMState *env, const ARMCPRegInfo *ri,
     GICv3CPUState *cs = icc_cs_from_env(env);
     int irq = value & 0xffffff;
     int grp;
+    bool is_eoir0 = ri->crm == 8;
 
-    if (icv_access(env, ri->crm == 8 ? HCR_FMO : HCR_IMO)) {
+    if (icv_access(env, is_eoir0 ? HCR_FMO : HCR_IMO)) {
         icv_eoir_write(env, ri, value);
         return;
     }
 
-    trace_gicv3_icc_eoir_write(ri->crm == 8 ? 0 : 1,
+    trace_gicv3_icc_eoir_write(is_eoir0 ? 0 : 1,
                                gicv3_redist_affid(cs), value);
 
-    if (ri->crm == 8) {
-        /* EOIR0 */
-        grp = GICV3_G0;
-    } else {
-        /* EOIR1 */
-        if (arm_is_secure(env)) {
-            grp = GICV3_G1;
-        } else {
-            grp = GICV3_G1NS;
-        }
-    }
-
-    if (irq >= cs->gic->num_irq) {
+    if ((irq >= cs->gic->num_irq) &&
+        !(cs->gic->lpi_enable && (irq >= GICV3_LPI_INTID_START))) {
         /* This handles two cases:
          * 1. If software writes the ID of a spurious interrupt [ie 1020-1023]
          * to the GICC_EOIR, the GIC ignores that write.
@@ -1335,7 +1327,36 @@ static void icc_eoir_write(CPUARMState *env, const ARMCPRegInfo *ri,
         return;
     }
 
-    if (icc_highest_active_group(cs) != grp) {
+    grp = icc_highest_active_group(cs);
+    switch (grp) {
+    case GICV3_G0:
+        if (!is_eoir0) {
+            return;
+        }
+        if (!(cs->gic->gicd_ctlr & GICD_CTLR_DS)
+            && arm_feature(env, ARM_FEATURE_EL3) && !arm_is_secure(env)) {
+            return;
+        }
+        break;
+    case GICV3_G1:
+        if (is_eoir0) {
+            return;
+        }
+        if (!arm_is_secure(env)) {
+            return;
+        }
+        break;
+    case GICV3_G1NS:
+        if (is_eoir0) {
+            return;
+        }
+        if (!arm_is_el3_or_mon(env) && arm_is_secure(env)) {
+            return;
+        }
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: IRQ %d isn't active\n", __func__, irq);
         return;
     }
 
@@ -1552,8 +1573,9 @@ static void icc_dir_write(CPUARMState *env, const ARMCPRegInfo *ri,
     /* No need to include !IsSecure in route_*_to_el2 as it's only
      * tested in cases where we know !IsSecure is true.
      */
-    route_fiq_to_el2 = arm_hcr_el2_fmo(env);
-    route_irq_to_el2 = arm_hcr_el2_imo(env);
+    uint64_t hcr_el2 = arm_hcr_el2_eff(env);
+    route_fiq_to_el2 = hcr_el2 & HCR_FMO;
+    route_irq_to_el2 = hcr_el2 & HCR_IMO;
 
     switch (arm_current_el(env)) {
     case 3:
@@ -1855,7 +1877,7 @@ static void icc_ctlr_el3_write(CPUARMState *env, const ARMCPRegInfo *ri,
     trace_gicv3_icc_ctlr_el3_write(gicv3_redist_affid(cs), value);
 
     /* *_EL1NS and *_EL1S bits are aliases into the ICC_CTLR_EL1 bits. */
-    cs->icc_ctlr_el1[GICV3_NS] &= (ICC_CTLR_EL1_CBPR | ICC_CTLR_EL1_EOIMODE);
+    cs->icc_ctlr_el1[GICV3_NS] &= ~(ICC_CTLR_EL1_CBPR | ICC_CTLR_EL1_EOIMODE);
     if (value & ICC_CTLR_EL3_EOIMODE_EL1NS) {
         cs->icc_ctlr_el1[GICV3_NS] |= ICC_CTLR_EL1_EOIMODE;
     }
@@ -1863,7 +1885,7 @@ static void icc_ctlr_el3_write(CPUARMState *env, const ARMCPRegInfo *ri,
         cs->icc_ctlr_el1[GICV3_NS] |= ICC_CTLR_EL1_CBPR;
     }
 
-    cs->icc_ctlr_el1[GICV3_S] &= (ICC_CTLR_EL1_CBPR | ICC_CTLR_EL1_EOIMODE);
+    cs->icc_ctlr_el1[GICV3_S] &= ~(ICC_CTLR_EL1_CBPR | ICC_CTLR_EL1_EOIMODE);
     if (value & ICC_CTLR_EL3_EOIMODE_EL1S) {
         cs->icc_ctlr_el1[GICV3_S] |= ICC_CTLR_EL1_EOIMODE;
     }
@@ -1895,8 +1917,8 @@ static CPAccessResult gicv3_irqfiq_access(CPUARMState *env,
     if ((env->cp15.scr_el3 & (SCR_FIQ | SCR_IRQ)) == (SCR_FIQ | SCR_IRQ)) {
         switch (el) {
         case 1:
-            if (arm_is_secure_below_el3(env) ||
-                (arm_hcr_el2_imo(env) == 0 && arm_hcr_el2_fmo(env) == 0)) {
+            /* Note that arm_hcr_el2_eff takes secure state into account.  */
+            if ((arm_hcr_el2_eff(env) & (HCR_IMO | HCR_FMO)) == 0) {
                 r = CP_ACCESS_TRAP_EL3;
             }
             break;
@@ -1936,8 +1958,8 @@ static CPAccessResult gicv3_dir_access(CPUARMState *env,
 static CPAccessResult gicv3_sgi_access(CPUARMState *env,
                                        const ARMCPRegInfo *ri, bool isread)
 {
-    if ((arm_hcr_el2_imo(env) || arm_hcr_el2_fmo(env)) &&
-        arm_current_el(env) == 1 && !arm_is_secure_below_el3(env)) {
+    if (arm_current_el(env) == 1 &&
+        (arm_hcr_el2_eff(env) & (HCR_IMO | HCR_FMO)) != 0) {
         /* Takes priority over a possible EL3 trap */
         return CP_ACCESS_TRAP_EL2;
     }
@@ -1961,7 +1983,7 @@ static CPAccessResult gicv3_fiq_access(CPUARMState *env,
     if (env->cp15.scr_el3 & SCR_FIQ) {
         switch (el) {
         case 1:
-            if (arm_is_secure_below_el3(env) || !arm_hcr_el2_fmo(env)) {
+            if ((arm_hcr_el2_eff(env) & HCR_FMO) == 0) {
                 r = CP_ACCESS_TRAP_EL3;
             }
             break;
@@ -2000,7 +2022,7 @@ static CPAccessResult gicv3_irq_access(CPUARMState *env,
     if (env->cp15.scr_el3 & SCR_IRQ) {
         switch (el) {
         case 1:
-            if (arm_is_secure_below_el3(env) || !arm_hcr_el2_imo(env)) {
+            if ((arm_hcr_el2_eff(env) & HCR_IMO) == 0) {
                 r = CP_ACCESS_TRAP_EL3;
             }
             break;
@@ -2365,7 +2387,7 @@ static void ich_vmcr_write(CPUARMState *env, const ARMCPRegInfo *ri,
     /* Enforce "writing BPRs to less than minimum sets them to the minimum"
      * by reading and writing back the fields.
      */
-    write_vbpr(cs, GICV3_G1, read_vbpr(cs, GICV3_G0));
+    write_vbpr(cs, GICV3_G0, read_vbpr(cs, GICV3_G0));
     write_vbpr(cs, GICV3_G1, read_vbpr(cs, GICV3_G1));
 
     gicv3_cpuif_virt_update(cs);
@@ -2618,8 +2640,6 @@ void gicv3_init_cpuif(GICv3State *s)
         if (arm_feature(&cpu->env, ARM_FEATURE_EL2)
             && cpu->gic_num_lrs) {
             int j;
-
-            cs->maintenance_irq = cpu->gicv3_maintenance_interrupt;
 
             cs->num_list_regs = cpu->gic_num_lrs;
             cs->vpribits = cpu->gic_vpribits;

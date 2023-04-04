@@ -10,12 +10,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qemu/error-report.h"
 #include "sysemu/replay.h"
 #include "replay-internal.h"
 #include "block/aio.h"
 #include "ui/input.h"
+#include "hw/core/cpu.h"
 
 typedef struct Event {
     ReplayAsyncEventKind event_kind;
@@ -36,6 +36,9 @@ static void replay_run_event(Event *event)
     switch (event->event_kind) {
     case REPLAY_ASYNC_EVENT_BH:
         aio_bh_call(event->opaque);
+        break;
+    case REPLAY_ASYNC_EVENT_BH_ONESHOT:
+        ((QEMUBHFunc *)event->opaque)(event->opaque2);
         break;
     case REPLAY_ASYNC_EVENT_INPUT:
         qemu_input_event_send_impl(NULL, (InputEvent *)event->opaque);
@@ -75,6 +78,10 @@ bool replay_has_events(void)
 
 void replay_flush_events(void)
 {
+    if (replay_mode == REPLAY_MODE_NONE) {
+        return;
+    }
+
     g_assert(replay_mutex_locked());
 
     while (!QTAILQ_EMPTY(&events_list)) {
@@ -112,7 +119,7 @@ void replay_add_event(ReplayAsyncEventKind event_kind,
         return;
     }
 
-    Event *event = g_malloc0(sizeof(Event));
+    Event *event = g_new0(Event, 1);
     event->event_kind = event_kind;
     event->opaque = opaque;
     event->opaque2 = opaque2;
@@ -120,15 +127,27 @@ void replay_add_event(ReplayAsyncEventKind event_kind,
 
     g_assert(replay_mutex_locked());
     QTAILQ_INSERT_TAIL(&events_list, event, events);
+    qemu_cpu_kick(first_cpu);
 }
 
 void replay_bh_schedule_event(QEMUBH *bh)
 {
     if (events_enabled) {
-        uint64_t id = replay_get_current_step();
+        uint64_t id = replay_get_current_icount();
         replay_add_event(REPLAY_ASYNC_EVENT_BH, bh, NULL, id);
     } else {
         qemu_bh_schedule(bh);
+    }
+}
+
+void replay_bh_schedule_oneshot_event(AioContext *ctx,
+    QEMUBHFunc *cb, void *opaque)
+{
+    if (events_enabled) {
+        uint64_t id = replay_get_current_icount();
+        replay_add_event(REPLAY_ASYNC_EVENT_BH_ONESHOT, cb, opaque, id);
+    } else {
+        aio_bh_schedule_oneshot(ctx, cb, opaque);
     }
 }
 
@@ -162,6 +181,7 @@ static void replay_save_event(Event *event, int checkpoint)
         /* save event-specific data */
         switch (event->event_kind) {
         case REPLAY_ASYNC_EVENT_BH:
+        case REPLAY_ASYNC_EVENT_BH_ONESHOT:
             replay_put_qword(event->id);
             break;
         case REPLAY_ASYNC_EVENT_INPUT:
@@ -217,22 +237,23 @@ static Event *replay_read_event(int checkpoint)
     /* Events that has not to be in the queue */
     switch (replay_state.read_event_kind) {
     case REPLAY_ASYNC_EVENT_BH:
+    case REPLAY_ASYNC_EVENT_BH_ONESHOT:
         if (replay_state.read_event_id == -1) {
             replay_state.read_event_id = replay_get_qword();
         }
         break;
     case REPLAY_ASYNC_EVENT_INPUT:
-        event = g_malloc0(sizeof(Event));
+        event = g_new0(Event, 1);
         event->event_kind = replay_state.read_event_kind;
         event->opaque = replay_read_input_event();
         return event;
     case REPLAY_ASYNC_EVENT_INPUT_SYNC:
-        event = g_malloc0(sizeof(Event));
+        event = g_new0(Event, 1);
         event->event_kind = replay_state.read_event_kind;
         event->opaque = 0;
         return event;
     case REPLAY_ASYNC_EVENT_CHAR_READ:
-        event = g_malloc0(sizeof(Event));
+        event = g_new0(Event, 1);
         event->event_kind = replay_state.read_event_kind;
         event->opaque = replay_event_char_read_load();
         return event;
@@ -242,7 +263,7 @@ static Event *replay_read_event(int checkpoint)
         }
         break;
     case REPLAY_ASYNC_EVENT_NET:
-        event = g_malloc0(sizeof(Event));
+        event = g_new0(Event, 1);
         event->event_kind = replay_state.read_event_kind;
         event->opaque = replay_event_net_load();
         return event;

@@ -26,14 +26,17 @@
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
-#include "qemu/sockets.h"	// struct in_addr needed for libslirp.h
-#include "sysemu/qtest.h"
-#include "sysemu/cpus.h"
+#include "sysemu/cpu-timers.h"
 #include "sysemu/replay.h"
-#include "slirp/libslirp.h"
 #include "qemu/main-loop.h"
 #include "block/aio.h"
 #include "qemu/error-report.h"
+#include "qemu/queue.h"
+#include "qemu/compiler.h"
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 #ifndef _WIN32
 
@@ -41,6 +44,16 @@
  * use signalfd to listen for them.  We rely on whatever the current signal
  * handler is to dispatch the signals when we receive them.
  */
+/*
+ * Disable CFI checks.
+ * We are going to call a signal hander directly. Such handler may or may not
+ * have been defined in our binary, so there's no guarantee that the pointer
+ * used to set the handler is a cfi-valid pointer. Since the handlers are
+ * stored in kernel memory, changing the handler to an attacker-defined
+ * function requires being able to call a sigaction() syscall,
+ * which is not as easy as overwriting a pointer in memory.
+ */
+QEMU_DISABLE_CFI
 static void sigfd_handler(void *opaque)
 {
     int fd = (intptr_t)opaque;
@@ -58,7 +71,8 @@ static void sigfd_handler(void *opaque)
         }
 
         if (len != sizeof(info)) {
-            printf("read from sigfd returned %zd: %m\n", len);
+            error_report("read from sigfd returned %zd: %s", len,
+                         g_strerror(errno));
             return;
         }
 
@@ -71,7 +85,7 @@ static void sigfd_handler(void *opaque)
     }
 }
 
-static int qemu_signal_init(void)
+static int qemu_signal_init(Error **errp)
 {
     int sigfd;
     sigset_t set;
@@ -96,7 +110,7 @@ static int qemu_signal_init(void)
     sigdelset(&set, SIG_IPI);
     sigfd = qemu_signalfd(&set);
     if (sigfd == -1) {
-        fprintf(stderr, "failed to create signalfd\n");
+        error_setg_errno(errp, errno, "failed to create signalfd");
         return -errno;
     }
 
@@ -109,7 +123,7 @@ static int qemu_signal_init(void)
 
 #else /* _WIN32 */
 
-static int qemu_signal_init(void)
+static int qemu_signal_init(Error **errp)
 {
     return 0;
 }
@@ -144,20 +158,19 @@ int qemu_init_main_loop(Error **errp)
 {
     int ret;
     GSource *src;
-    Error *local_error = NULL;
 
     init_clocks(qemu_timer_notify_cb);
 
-    ret = qemu_signal_init();
+    ret = qemu_signal_init(errp);
     if (ret) {
         return ret;
     }
 
-    qemu_aio_context = aio_context_new(&local_error);
+    qemu_aio_context = aio_context_new(errp);
     if (!qemu_aio_context) {
-        error_propagate(errp, local_error);
         return -EMFILE;
     }
+    qemu_set_current_aio_context(qemu_aio_context);
     qemu_notify_bh = qemu_bh_new(notify_event_cb, NULL);
     gpollfds = g_array_new(FALSE, FALSE, sizeof(GPollFD));
     src = aio_get_g_source(qemu_aio_context);
@@ -176,6 +189,10 @@ static int max_priority;
 #ifndef _WIN32
 static int glib_pollfds_idx;
 static int glib_n_poll_fds;
+
+void qemu_fd_register(int fd)
+{
+}
 
 static void glib_pollfds_fill(int64_t *cur_timeout)
 {
@@ -256,7 +273,7 @@ static PollingEntry *first_polling_entry;
 int qemu_add_polling_cb(PollingFunc *func, void *opaque)
 {
     PollingEntry **ppe, *pe;
-    pe = g_malloc0(sizeof(PollingEntry));
+    pe = g_new0(PollingEntry, 1);
     pe->func = func;
     pe->opaque = opaque;
     for(ppe = &first_polling_entry; *ppe != NULL; ppe = &(*ppe)->next);
@@ -424,7 +441,7 @@ static int os_host_main_loop_wait(int64_t timeout)
     g_main_context_prepare(context, &max_priority);
     n_poll_fds = g_main_context_query(context, max_priority, &poll_timeout,
                                       poll_fds, ARRAY_SIZE(poll_fds));
-    g_assert(n_poll_fds <= ARRAY_SIZE(poll_fds));
+    g_assert(n_poll_fds + w->num <= ARRAY_SIZE(poll_fds));
 
     for (i = 0; i < w->num; i++) {
         poll_fds[n_poll_fds + i].fd = (DWORD_PTR)w->events[i];
@@ -469,25 +486,42 @@ static int os_host_main_loop_wait(int64_t timeout)
 }
 #endif
 
+static NotifierList main_loop_poll_notifiers =
+    NOTIFIER_LIST_INITIALIZER(main_loop_poll_notifiers);
+
+void main_loop_poll_add_notifier(Notifier *notify)
+{
+    notifier_list_add(&main_loop_poll_notifiers, notify);
+}
+
+void main_loop_poll_remove_notifier(Notifier *notify)
+{
+    notifier_remove(notify);
+}
+
 void main_loop_wait(int nonblocking)
 {
+    MainLoopPoll mlpoll = {
+        .state = MAIN_LOOP_POLL_FILL,
+        .timeout = UINT32_MAX,
+        .pollfds = gpollfds,
+    };
     int ret;
-    uint32_t timeout = UINT32_MAX;
     int64_t timeout_ns;
 
     if (nonblocking) {
-        timeout = 0;
+        mlpoll.timeout = 0;
     }
 
     /* poll any events */
     g_array_set_size(gpollfds, 0); /* reset for new iteration */
     /* XXX: separate device handlers from system ones */
-    slirp_pollfds_fill(gpollfds, &timeout);
+    notifier_list_notify(&main_loop_poll_notifiers, &mlpoll);
 
-    if (timeout == UINT32_MAX) {
+    if (mlpoll.timeout == UINT32_MAX) {
         timeout_ns = -1;
     } else {
-        timeout_ns = (uint64_t)timeout * (int64_t)(SCALE_MS);
+        timeout_ns = (uint64_t)mlpoll.timeout * (int64_t)(SCALE_MS);
     }
 
     timeout_ns = qemu_soonest_timeout(timeout_ns,
@@ -495,17 +529,66 @@ void main_loop_wait(int nonblocking)
                                           &main_loop_tlg));
 
     ret = os_host_main_loop_wait(timeout_ns);
-    slirp_pollfds_poll(gpollfds, (ret < 0));
+    mlpoll.state = ret < 0 ? MAIN_LOOP_POLL_ERR : MAIN_LOOP_POLL_OK;
+    notifier_list_notify(&main_loop_poll_notifiers, &mlpoll);
 
-    /* CPU thread can infinitely wait for event after
-       missing the warp */
-    qemu_start_warp_timer();
+    if (icount_enabled()) {
+        /*
+         * CPU thread can infinitely wait for event after
+         * missing the warp
+         */
+        icount_start_warp_timer();
+    }
     qemu_clock_run_all_timers();
 }
 
 /* Functions to operate on the main QEMU AioContext.  */
 
-QEMUBH *qemu_bh_new(QEMUBHFunc *cb, void *opaque)
+QEMUBH *qemu_bh_new_full(QEMUBHFunc *cb, void *opaque, const char *name)
 {
-    return aio_bh_new(qemu_aio_context, cb, opaque);
+    return aio_bh_new_full(qemu_aio_context, cb, opaque, name);
+}
+
+/*
+ * Functions to operate on the I/O handler AioContext.
+ * This context runs on top of main loop. We can't reuse qemu_aio_context
+ * because iohandlers mustn't be polled by aio_poll(qemu_aio_context).
+ */
+static AioContext *iohandler_ctx;
+
+static void iohandler_init(void)
+{
+    if (!iohandler_ctx) {
+        iohandler_ctx = aio_context_new(&error_abort);
+    }
+}
+
+AioContext *iohandler_get_aio_context(void)
+{
+    iohandler_init();
+    return iohandler_ctx;
+}
+
+GSource *iohandler_get_g_source(void)
+{
+    iohandler_init();
+    return aio_get_g_source(iohandler_ctx);
+}
+
+void qemu_set_fd_handler(int fd,
+                         IOHandler *fd_read,
+                         IOHandler *fd_write,
+                         void *opaque)
+{
+    iohandler_init();
+    aio_set_fd_handler(iohandler_ctx, fd, false,
+                       fd_read, fd_write, NULL, NULL, opaque);
+}
+
+void event_notifier_set_handler(EventNotifier *e,
+                                EventNotifierHandler *handler)
+{
+    iohandler_init();
+    aio_set_event_notifier(iohandler_ctx, e, false,
+                           handler, NULL, NULL);
 }

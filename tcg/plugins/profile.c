@@ -30,7 +30,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 #include "disas/disas.h"
 
 #include <glib.h>

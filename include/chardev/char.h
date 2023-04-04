@@ -2,8 +2,8 @@
 #define QEMU_CHAR_H
 
 #include "qapi/qapi-types-char.h"
-#include "qemu/main-loop.h"
 #include "qemu/bitmap.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 
 #define IAC_EOR 239
@@ -47,6 +47,9 @@ typedef enum {
     QEMU_CHAR_FEATURE_FD_PASS,
     /* Whether replay or record mode is enabled */
     QEMU_CHAR_FEATURE_REPLAY,
+    /* Whether the gcontext can be changed after calling
+     * qemu_chr_be_update_read_handlers() */
+    QEMU_CHAR_FEATURE_GCONTEXT,
 
     QEMU_CHAR_FEATURE_LAST,
 } ChardevFeature;
@@ -62,6 +65,8 @@ struct Chardev {
     char *filename;
     int logfd;
     int be_open;
+    /* used to coordinate the chardev-change special-case: */
+    bool handover_yank_instance;
     GSource *gsource;
     GMainContext *gcontext;
     DECLARE_BITMAP(features, QEMU_CHAR_FEATURE_LAST);
@@ -70,6 +75,7 @@ struct Chardev {
 /**
  * qemu_chr_new_from_opts:
  * @opts: see qemu-config.c for a list of valid options
+ * @context: the #GMainContext to be used at initialization time
  *
  * Create a new character backend from a QemuOpts list.
  *
@@ -78,6 +84,7 @@ struct Chardev {
  *                            or left untouched in case of help option
  */
 Chardev *qemu_chr_new_from_opts(QemuOpts *opts,
+                                GMainContext *context,
                                 Error **errp);
 
 /**
@@ -103,25 +110,29 @@ ChardevBackend *qemu_chr_parse_opts(QemuOpts *opts,
  * qemu_chr_new:
  * @label: the name of the backend
  * @filename: the URI
+ * @context: the #GMainContext to be used at initialization time
  *
  * Create a new character backend from a URI.
  * Do not implicitly initialize a monitor if the chardev is muxed.
  *
  * Returns: a new character backend
  */
-Chardev *qemu_chr_new(const char *label, const char *filename);
+Chardev *qemu_chr_new(const char *label, const char *filename,
+                      GMainContext *context);
 
 /**
  * qemu_chr_new_mux_mon:
  * @label: the name of the backend
  * @filename: the URI
+ * @context: the #GMainContext to be used at initialization time
  *
  * Create a new character backend from a URI.
  * Implicitly initialize a monitor if the chardev is muxed.
  *
  * Returns: a new character backend
  */
-Chardev *qemu_chr_new_mux_mon(const char *label, const char *filename);
+Chardev *qemu_chr_new_mux_mon(const char *label, const char *filename,
+                              GMainContext *context);
 
 /**
 * qemu_chr_change:
@@ -143,6 +154,7 @@ void qemu_chr_cleanup(void);
  * @label: the name of the backend
  * @filename: the URI
  * @permit_mux_mon: if chardev is muxed, initialize a monitor
+ * @context: the #GMainContext to be used at initialization time
  *
  * Create a new character backend from a URI.
  * Character device communications are not written
@@ -151,7 +163,7 @@ void qemu_chr_cleanup(void);
  * Returns: a new character backend
  */
 Chardev *qemu_chr_new_noreplay(const char *label, const char *filename,
-                               bool permit_mux_mon);
+                               bool permit_mux_mon, GMainContext *context);
 
 /**
  * qemu_chr_be_can_write:
@@ -200,7 +212,7 @@ void qemu_chr_be_update_read_handlers(Chardev *s,
  *
  * Send an event from the back end to the front end.
  */
-void qemu_chr_be_event(Chardev *s, int event);
+void qemu_chr_be_event(Chardev *s, QEMUChrEvent event);
 
 int qemu_chr_add_client(Chardev *s, int fd);
 Chardev *qemu_chr_find(const char *name);
@@ -216,11 +228,7 @@ int qemu_chr_write(Chardev *s, const uint8_t *buf, int len, bool write_all);
 int qemu_chr_wait_connected(Chardev *chr, Error **errp);
 
 #define TYPE_CHARDEV "chardev"
-#define CHARDEV(obj) OBJECT_CHECK(Chardev, (obj), TYPE_CHARDEV)
-#define CHARDEV_CLASS(klass) \
-    OBJECT_CLASS_CHECK(ChardevClass, (klass), TYPE_CHARDEV)
-#define CHARDEV_GET_CLASS(obj) \
-    OBJECT_GET_CLASS(ChardevClass, (obj), TYPE_CHARDEV)
+OBJECT_DECLARE_TYPE(Chardev, ChardevClass, CHARDEV)
 
 #define TYPE_CHARDEV_NULL "chardev-null"
 #define TYPE_CHARDEV_MUX "chardev-mux"
@@ -241,40 +249,76 @@ int qemu_chr_wait_connected(Chardev *chr, Error **errp);
 #define CHARDEV_IS_PTY(chr) \
     object_dynamic_cast(OBJECT(chr), TYPE_CHARDEV_PTY)
 
-typedef struct ChardevClass {
+struct ChardevClass {
     ObjectClass parent_class;
 
     bool internal; /* TODO: eventually use TYPE_USER_CREATABLE */
+    bool supports_yank;
+
+    /* parse command line options and populate QAPI @backend */
     void (*parse)(QemuOpts *opts, ChardevBackend *backend, Error **errp);
 
+    /* called after construction, open/starts the backend */
     void (*open)(Chardev *chr, ChardevBackend *backend,
                  bool *be_opened, Error **errp);
 
+    /* write buf to the backend */
     int (*chr_write)(Chardev *s, const uint8_t *buf, int len);
+
+    /*
+     * Read from the backend (blocking). A typical front-end will instead rely
+     * on chr_can_read/chr_read being called when polling/looping.
+     */
     int (*chr_sync_read)(Chardev *s, const uint8_t *buf, int len);
+
+    /* create a watch on the backend */
     GSource *(*chr_add_watch)(Chardev *s, GIOCondition cond);
+
+    /* update the backend internal sources */
     void (*chr_update_read_handler)(Chardev *s);
+
+    /* send an ioctl to the backend */
     int (*chr_ioctl)(Chardev *s, int cmd, void *arg);
+
+    /* get ancillary-received fds during last read */
     int (*get_msgfds)(Chardev *s, int* fds, int num);
+
+    /* set ancillary fds to be sent with next write */
     int (*set_msgfds)(Chardev *s, int *fds, int num);
+
+    /* accept the given fd */
     int (*chr_add_client)(Chardev *chr, int fd);
+
+    /* wait for a connection */
     int (*chr_wait_connected)(Chardev *chr, Error **errp);
+
+    /* disconnect a connection */
     void (*chr_disconnect)(Chardev *chr);
+
+    /* called by frontend when it can read */
     void (*chr_accept_input)(Chardev *chr);
+
+    /* set terminal echo */
     void (*chr_set_echo)(Chardev *chr, bool echo);
+
+    /* notify the backend of frontend open state */
     void (*chr_set_fe_open)(Chardev *chr, int fe_open);
-    void (*chr_be_event)(Chardev *s, int event);
-    /* Return 0 if succeeded, 1 if failed */
-    int (*chr_machine_done)(Chardev *chr);
-} ChardevClass;
+
+    /* handle various events */
+    void (*chr_be_event)(Chardev *s, QEMUChrEvent event);
+};
 
 Chardev *qemu_chardev_new(const char *id, const char *typename,
-                          ChardevBackend *backend, Error **errp);
+                          ChardevBackend *backend, GMainContext *context,
+                          Error **errp);
 
 extern int term_escape_char;
 
 GSource *qemu_chr_timeout_add_ms(Chardev *chr, guint ms,
                                  GSourceFunc func, void *private);
+
+void suspend_mux_open(void);
+void resume_mux_open(void);
 
 /* console.c */
 void qemu_chr_parse_vc(QemuOpts *opts, ChardevBackend *backend, Error **errp);

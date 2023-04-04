@@ -21,12 +21,13 @@
 #define CPU_LOOP_COMMON_H
 
 #include "exec/log.h"
+#include "special-errno.h"
 
 #define EXCP_DUMP(env, fmt, ...)                                        \
 do {                                                                    \
-    CPUState *cs = ENV_GET_CPU(env);                                    \
+    CPUState *cs = env_cpu(env);                                        \
     fprintf(stderr, fmt , ## __VA_ARGS__);                              \
-    cpu_dump_state(cs, stderr, fprintf, 0);                             \
+    cpu_dump_state(cs, stderr, 0);                                      \
     if (qemu_log_separate()) {                                          \
         qemu_log(fmt, ## __VA_ARGS__);                                  \
         log_cpu_state(cs, 0);                                           \

@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "block/block_int.h"
 #include "qemu/job.h"
+#include "qemu/main-loop.h"
 #include "qapi/qapi-commands-block-core.h"
 #include "qapi/qapi-visit-block-core.h"
 #include "qapi/clone-visitor.h"
@@ -40,6 +41,8 @@ static int coroutine_fn blockdev_create_run(Job *job, Error **errp)
 {
     BlockdevCreateJob *s = container_of(job, BlockdevCreateJob, common);
     int ret;
+
+    GLOBAL_STATE_CODE();
 
     job_progress_set_remaining(&s->common, 1);
     ret = s->drv->bdrv_co_create(s->opts, errp);
@@ -63,9 +66,13 @@ void qmp_blockdev_create(const char *job_id, BlockdevCreateOptions *options,
     const char *fmt = BlockdevDriver_str(options->driver);
     BlockDriver *drv = bdrv_find_format(fmt);
 
+    if (!drv) {
+        error_setg(errp, "Block driver '%s' not found or not supported", fmt);
+        return;
+    }
+
     /* If the driver is in the schema, we know that it exists. But it may not
      * be whitelisted. */
-    assert(drv);
     if (bdrv_uses_whitelist() && !bdrv_is_whitelisted(drv, false)) {
         error_setg(errp, "Driver is not whitelisted");
         return;

@@ -29,7 +29,7 @@
  * trace - Execution trace plugin
  *
  * Usage:
- *   $ env TPI_OUTPUT=trace.txt qemu-arch -tcg-plugin trace cmd...
+ *   $ env TPI_OUTPUT=trace.txt qemu-arch tcg-plugin trace cmd...
  *
  * Generates a full execution trace, actually a trace of executed
  * Target blocks.
@@ -50,7 +50,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <sys/syscall.h>
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 #include "disas/disas.h"
 
 static void pre_tb_helper_code(const TCGPluginInterface *tpi,

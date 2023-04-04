@@ -35,11 +35,10 @@
 #include <pthread.h>     /* pthread_*(3p), */
 
 #ifdef CONFIG_USER_ONLY
-#ifndef QEMU_H
-/* Defined by linux_user/qemu.h. */
+#ifndef LINUX_USER_USER_INTERNALS_H // Avoid double declaration
 extern __thread CPUState *thread_cpu;
-#endif
-#endif
+#endif // LINUX_USER_USER_INTERNALS_H
+#endif // CONFIG_USER_ONLY
 
 extern __thread uint32_t _tpi_thread_tid;
 
@@ -59,7 +58,7 @@ static inline uint64_t get_host_addr_through_mmu(const TCGPluginInterface *tpi,
     int mmu_idx;
 
     addr = ptr;
-    page_index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
+    page_index = (addr >> TARGET_PAGE_BITS) & (CPU_VTLB_SIZE - 1);
     CPUArchState* env = tpi_current_cpu_arch(tpi);
     mmu_idx = cpu_mmu_index(env, false);
     uintptr_t hostaddr = addr + env->tlb_table[mmu_idx][page_index].addend;

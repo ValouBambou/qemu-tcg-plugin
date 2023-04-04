@@ -30,7 +30,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 
 #ifdef CONFIG_CAPSTONE
 #include <capstone.h>
@@ -116,11 +116,13 @@ static csh get_cs_handle(const TCGPluginInterface *tpi)
     csh cs_handle = cs_handles[0];
 
 #if defined(TARGET_ARM) || defined(TARGET_AARCH64)
-    if (ARM_TBFLAG_THUMB(tpi_tb(tpi)->flags)) {
+    // This may not work if the target block changes the CPU mode
+    if (tpi->tcg_ctx->cpu->env_ptr->thumb) {
         cs_handle = cs_handles[1];
     }
 #if defined(TARGET_AARCH64)
-    if (ARM_TBFLAG_AARCH64_STATE(tpi_tb(tpi)->flags)) {
+    // This may not work if the target block changes the CPU mode
+    if (tpi->tcg_ctx->cpu->env_ptr->aarch64) {
         cs_handle = cs_handles[2];
     }
 #endif
@@ -183,7 +185,7 @@ static void after_gen_opc(const TCGPluginInterface *tpi, const TPIOpCode *tpi_op
     const uint8_t *code = (const uint8_t *)(intptr_t)tpi_guest_ptr(tpi, tpi_opcode->pc);
     size_t size = 4096;
     uint64_t address = tpi_opcode->pc;
-    
+
     if (tpi_opcode->operator != INDEX_op_insn_start) return;
 
     decoded = cs_disasm_iter(get_cs_handle(tpi),

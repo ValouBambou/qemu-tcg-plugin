@@ -54,7 +54,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 #include "disas/disas.h"
 
 /* Only ported to those architectures. */

@@ -545,7 +545,7 @@ static json json_one_block(const basic_block& bb)
     for (auto* s : symbols)
         j_syms.emplace_back(s->id());
 
-    json loop_header;
+    json loop_header = {{}};
     if (bb.loop_header())
         loop_header = bb.loop_header()->id();
 

@@ -29,7 +29,7 @@
 #include <inttypes.h>
 #include <math.h>
 
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 
 #define D4ADDR uint64_t
 #include "d4-7/d4.h"
@@ -171,7 +171,8 @@ static void after_gen_opc(const TCGPluginInterface *tpi, const TPIOpCode *tpi_op
 #if defined(TARGET_SH4)
         MEMACCESS('i', 2);
 #elif defined(TARGET_ARM)
-        MEMACCESS('i', ARM_TBFLAG_THUMB(tpi->tb->flags) ? 2 : 4);
+        CPUARMTBFlags tb_flags = (CPUARMTBFlags){ tpi->tb->flags, tpi->tb->cs_base };
+        MEMACCESS('i', EX_TBFLAG_AM32(tb_flags, THUMB) ? 2 : 4);
 #else
         MEMACCESS('i', 4); /* Assume 4 bytes, even for variable length encoding. */
 #endif
@@ -509,14 +510,14 @@ void tpi_init(TCGPluginInterface *tpi)
     int i, argc;
     char **argv;
     char *cmdline;
-    const char *latencies;
+    const char *latencies = getenv("DINEROIV_LATENCIES");
     const char *output_flags_str;
 
     TPI_INIT_VERSION(tpi);
     TPI_DECL_FUNC_3(tpi, after_exec_opc, void, i64, i64, i64);
 
     /* Sorry, for simplicity works on 64 bits hosts only. */
-    assert(TCG_TARGET_REG_BITS == TARGET_LONG_BITS);
+    assert(TCG_TARGET_REG_BITS == 8*TARGET_LONG_SIZE);
     assert(TCG_TARGET_REG_BITS == 64);
 
     assert(sizeof(access_info_t) == sizeof(uint64_t));
@@ -533,7 +534,6 @@ void tpi_init(TCGPluginInterface *tpi)
     parse_output_flags(output_flags_str);
 
     if (output_flags & OUTPUT_CYCLES) {
-        latencies = getenv("DINEROIV_LATENCIES");
         if (latencies == NULL) {
             latencies = DINEROIV_DEFAULT_LATENCIES;
             fprintf(output, "# WARNING: using default latencies "

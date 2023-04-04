@@ -25,7 +25,6 @@
 #include "qemu/osdep.h"
 #include "qemu/option.h"
 #include "cpu.h"
-#include "hw/hw.h"
 #include "hw/nvram/fw_cfg.h"
 #include "multiboot.h"
 #include "hw/loader.h"
@@ -144,7 +143,8 @@ static void mb_add_mod(MultibootState *s,
     s->mb_mods_count++;
 }
 
-int load_multiboot(FWCfgState *fw_cfg,
+int load_multiboot(X86MachineState *x86ms,
+                   FWCfgState *fw_cfg,
                    FILE *f,
                    const char *kernel_filename,
                    const char *initrd_filename,
@@ -152,6 +152,7 @@ int load_multiboot(FWCfgState *fw_cfg,
                    int kernel_file_size,
                    uint8_t *header)
 {
+    bool multiboot_dma_enabled = X86_MACHINE_GET_CLASS(x86ms)->fwcfg_dma_enabled;
     int i, is_multiboot = 0;
     uint32_t flags = 0;
     uint32_t mh_entry_addr;
@@ -199,8 +200,8 @@ int load_multiboot(FWCfgState *fw_cfg,
             exit(1);
         }
 
-        kernel_size = load_elf(kernel_filename, NULL, NULL, &elf_entry,
-                               &elf_low, &elf_high, 0, I386_ELF_MACHINE,
+        kernel_size = load_elf(kernel_filename, NULL, NULL, NULL, &elf_entry,
+                               &elf_low, &elf_high, NULL, 0, I386_ELF_MACHINE,
                                0, 0);
         if (kernel_size < 0) {
             error_report("Error while loading elf kernel");
@@ -343,7 +344,11 @@ int load_multiboot(FWCfgState *fw_cfg,
             mbs.mb_buf_size = TARGET_PAGE_ALIGN(mb_mod_length + mbs.mb_buf_size);
             mbs.mb_buf = g_realloc(mbs.mb_buf, mbs.mb_buf_size);
 
-            load_image(one_file, (unsigned char *)mbs.mb_buf + offs);
+            if (load_image_size(one_file, (unsigned char *)mbs.mb_buf + offs,
+                                mbs.mb_buf_size - offs) < 0) {
+                error_report("Error loading file '%s'", one_file);
+                exit(1);
+            }
             mb_add_mod(&mbs, mbs.mb_buf_phys + offs,
                        mbs.mb_buf_phys + offs + mb_mod_length, c);
 
@@ -398,7 +403,11 @@ int load_multiboot(FWCfgState *fw_cfg,
     fw_cfg_add_bytes(fw_cfg, FW_CFG_INITRD_DATA, mb_bootinfo_data,
                      sizeof(bootinfo));
 
-    option_rom[nb_option_roms].name = "multiboot.bin";
+    if (multiboot_dma_enabled) {
+        option_rom[nb_option_roms].name = "multiboot_dma.bin";
+    } else {
+        option_rom[nb_option_roms].name = "multiboot.bin";
+    }
     option_rom[nb_option_roms].bootindex = 0;
     nb_option_roms++;
 

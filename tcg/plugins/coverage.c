@@ -28,7 +28,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
-#include "tcg-plugin.h"
+#include "tcg/tcg-plugin.h"
 #include "disas/disas.h"
 
 #ifdef CONFIG_CAPSTONE

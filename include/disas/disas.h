@@ -1,18 +1,20 @@
 #ifndef QEMU_DISAS_H
 #define QEMU_DISAS_H
 
-#include "qemu-common.h"
+#include "exec/hwaddr.h"
 
 #ifdef NEED_CPU_H
 #include "cpu.h"
 
 /* Disassemble this for me please... (debugging). */
-void disas(FILE *out, void *code, unsigned long size);
+void disas(FILE *out, const void *code, unsigned long size);
 void target_disas(FILE *out, CPUState *cpu, target_ulong code,
                   target_ulong size);
 
 void monitor_disas(Monitor *mon, CPUState *cpu,
                    target_ulong pc, int nb_insn, int is_physical);
+
+char *plugin_disas(CPUState *cpu, uint64_t addr, size_t size);
 
 /* Look up symbol for debugging purpose.  Returns "" if unknown. */
 const char *lookup_symbol(target_ulong orig_addr);
@@ -23,6 +25,9 @@ bool lookup_symbol5(target_ulong orig_addr, const char **symbol, const char **fi
 
 /* Look up symbol bounds by name for debugging purpose.  Returns false if unknown. */
 bool find_symbol_bounds(const char *name, bool is_elf_class64, uint64_t *start, uint64_t *size);
+
+/* Look up for the qemu-translated PC (with load bias) */
+target_ulong translate_pc(target_ulong address_in_file, const char *filename);
 #endif
 
 struct syminfo;

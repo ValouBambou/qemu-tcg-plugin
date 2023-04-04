@@ -43,18 +43,25 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu-common.h"
+#include "qemu/datadir.h"
 #include "qapi/error.h"
+#include "qapi/qapi-commands-machine.h"
+#include "qapi/type-helpers.h"
+#include "trace.h"
 #include "hw/hw.h"
 #include "disas/disas.h"
+#include "migration/vmstate.h"
 #include "monitor/monitor.h"
+#include "sysemu/reset.h"
 #include "sysemu/sysemu.h"
 #include "uboot_image.h"
 #include "hw/loader.h"
 #include "hw/nvram/fw_cfg.h"
 #include "exec/memory.h"
-#include "exec/address-spaces.h"
 #include "hw/boards.h"
 #include "qemu/cutils.h"
+#include "sysemu/runstate.h"
 
 #include <zlib.h>
 
@@ -74,49 +81,23 @@ int64_t get_image_size(const char *filename)
 }
 
 /* return the size or -1 if error */
-/* deprecated, because caller does not specify buffer size! */
-int load_image(const char *filename, uint8_t *addr)
-{
-    int fd, size;
-    fd = open(filename, O_RDONLY | O_BINARY);
-    if (fd < 0)
-        return -1;
-    size = lseek(fd, 0, SEEK_END);
-    if (size == -1) {
-        fprintf(stderr, "file %-20s: get size error: %s\n",
-                filename, strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    lseek(fd, 0, SEEK_SET);
-    if (read(fd, addr, size) != size) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    return size;
-}
-
-/* return the size or -1 if error */
 ssize_t load_image_size(const char *filename, void *addr, size_t size)
 {
     int fd;
-    ssize_t actsize;
+    ssize_t actsize, l = 0;
 
     fd = open(filename, O_RDONLY | O_BINARY);
     if (fd < 0) {
         return -1;
     }
 
-    actsize = read(fd, addr, size);
-    if (actsize < 0) {
-        close(fd);
-        return -1;
+    while ((actsize = read(fd, addr + l, size - l)) > 0) {
+        l += actsize;
     }
+
     close(fd);
 
-    return actsize;
+    return actsize < 0 ? -1 : l;
 }
 
 /* read()-like version */
@@ -269,26 +250,26 @@ int load_aout(const char *filename, hwaddr addr, int max_sz,
     case OMAGIC:
         if (e.a_text + e.a_data > max_sz)
             goto fail;
-	lseek(fd, N_TXTOFF(e), SEEK_SET);
-	size = read_targphys(filename, fd, addr, e.a_text + e.a_data);
-	if (size < 0)
-	    goto fail;
-	break;
+        lseek(fd, N_TXTOFF(e), SEEK_SET);
+        size = read_targphys(filename, fd, addr, e.a_text + e.a_data);
+        if (size < 0)
+            goto fail;
+        break;
     case NMAGIC:
         if (N_DATADDR(e, target_page_size) + e.a_data > max_sz)
             goto fail;
-	lseek(fd, N_TXTOFF(e), SEEK_SET);
-	size = read_targphys(filename, fd, addr, e.a_text);
-	if (size < 0)
-	    goto fail;
+        lseek(fd, N_TXTOFF(e), SEEK_SET);
+        size = read_targphys(filename, fd, addr, e.a_text);
+        if (size < 0)
+            goto fail;
         ret = read_targphys(filename, fd, addr + N_DATADDR(e, target_page_size),
                             e.a_data);
-	if (ret < 0)
-	    goto fail;
-	size += ret;
-	break;
+        if (ret < 0)
+            goto fail;
+        size += ret;
+        break;
     default:
-	goto fail;
+        goto fail;
     }
     close(fd);
     return size;
@@ -347,7 +328,7 @@ static void *load_at(int fd, off_t offset, size_t size)
 #define SZ		64
 #include "hw/elf_ops.h"
 
-const char *load_elf_strerror(int error)
+const char *load_elf_strerror(ssize_t error)
 {
     switch (error) {
     case 0:
@@ -360,6 +341,8 @@ const char *load_elf_strerror(int error)
         return "The image is from incompatible architecture";
     case ELF_LOAD_WRONG_ENDIAN:
         return "The image has incorrect endianness";
+    case ELF_LOAD_TOO_BIG:
+        return "The image segments are too big to load";
     default:
         return "Unknown error";
     }
@@ -421,51 +404,60 @@ fail:
 }
 
 /* return < 0 if error, otherwise the number of bytes loaded in memory */
-int load_elf(const char *filename, uint64_t (*translate_fn)(void *, uint64_t),
-             void *translate_opaque, uint64_t *pentry, uint64_t *lowaddr,
-             uint64_t *highaddr, int big_endian, int elf_machine,
-             int clear_lsb, int data_swab)
-{
-    return load_elf_as(filename, translate_fn, translate_opaque, pentry,
-                       lowaddr, highaddr, big_endian, elf_machine, clear_lsb,
-                       data_swab, NULL);
-}
-
-/* return < 0 if error, otherwise the number of bytes loaded in memory */
-int load_elf_as(const char *filename,
-                uint64_t (*translate_fn)(void *, uint64_t),
-                void *translate_opaque, uint64_t *pentry, uint64_t *lowaddr,
-                uint64_t *highaddr, int big_endian, int elf_machine,
-                int clear_lsb, int data_swab, AddressSpace *as)
-{
-    return load_elf_ram(filename, translate_fn, translate_opaque,
-                        pentry, lowaddr, highaddr, big_endian, elf_machine,
-                        clear_lsb, data_swab, as, true);
-}
-
-/* return < 0 if error, otherwise the number of bytes loaded in memory */
-int load_elf_ram(const char *filename,
+ssize_t load_elf(const char *filename,
+                 uint64_t (*elf_note_fn)(void *, void *, bool),
                  uint64_t (*translate_fn)(void *, uint64_t),
                  void *translate_opaque, uint64_t *pentry, uint64_t *lowaddr,
-                 uint64_t *highaddr, int big_endian, int elf_machine,
-                 int clear_lsb, int data_swab, AddressSpace *as,
-                 bool load_rom)
+                 uint64_t *highaddr, uint32_t *pflags, int big_endian,
+                 int elf_machine, int clear_lsb, int data_swab)
 {
-    return load_elf_ram_sym(filename, translate_fn, translate_opaque,
-                            pentry, lowaddr, highaddr, big_endian,
+    return load_elf_as(filename, elf_note_fn, translate_fn, translate_opaque,
+                       pentry, lowaddr, highaddr, pflags, big_endian,
+                       elf_machine, clear_lsb, data_swab, NULL);
+}
+
+/* return < 0 if error, otherwise the number of bytes loaded in memory */
+ssize_t load_elf_as(const char *filename,
+                    uint64_t (*elf_note_fn)(void *, void *, bool),
+                    uint64_t (*translate_fn)(void *, uint64_t),
+                    void *translate_opaque, uint64_t *pentry, uint64_t *lowaddr,
+                    uint64_t *highaddr, uint32_t *pflags, int big_endian,
+                    int elf_machine, int clear_lsb, int data_swab,
+                    AddressSpace *as)
+{
+    return load_elf_ram(filename, elf_note_fn, translate_fn, translate_opaque,
+                        pentry, lowaddr, highaddr, pflags, big_endian,
+                        elf_machine, clear_lsb, data_swab, as, true);
+}
+
+/* return < 0 if error, otherwise the number of bytes loaded in memory */
+ssize_t load_elf_ram(const char *filename,
+                     uint64_t (*elf_note_fn)(void *, void *, bool),
+                     uint64_t (*translate_fn)(void *, uint64_t),
+                     void *translate_opaque, uint64_t *pentry,
+                     uint64_t *lowaddr, uint64_t *highaddr, uint32_t *pflags,
+                     int big_endian, int elf_machine, int clear_lsb,
+                     int data_swab, AddressSpace *as, bool load_rom)
+{
+    return load_elf_ram_sym(filename, elf_note_fn,
+                            translate_fn, translate_opaque,
+                            pentry, lowaddr, highaddr, pflags, big_endian,
                             elf_machine, clear_lsb, data_swab, as,
                             load_rom, NULL);
 }
 
 /* return < 0 if error, otherwise the number of bytes loaded in memory */
-int load_elf_ram_sym(const char *filename,
-                     uint64_t (*translate_fn)(void *, uint64_t),
-                     void *translate_opaque, uint64_t *pentry,
-                     uint64_t *lowaddr, uint64_t *highaddr, int big_endian,
-                     int elf_machine, int clear_lsb, int data_swab,
-                     AddressSpace *as, bool load_rom, symbol_fn_t sym_cb)
+ssize_t load_elf_ram_sym(const char *filename,
+                         uint64_t (*elf_note_fn)(void *, void *, bool),
+                         uint64_t (*translate_fn)(void *, uint64_t),
+                         void *translate_opaque, uint64_t *pentry,
+                         uint64_t *lowaddr, uint64_t *highaddr,
+                         uint32_t *pflags, int big_endian, int elf_machine,
+                         int clear_lsb, int data_swab,
+                         AddressSpace *as, bool load_rom, symbol_fn_t sym_cb)
 {
-    int fd, data_order, target_data_order, must_swab, ret = ELF_LOAD_FAILED;
+    int fd, data_order, target_data_order, must_swab;
+    ssize_t ret = ELF_LOAD_FAILED;
     uint8_t e_ident[EI_NIDENT];
 
     fd = open(filename, O_RDONLY | O_BINARY);
@@ -501,13 +493,15 @@ int load_elf_ram_sym(const char *filename,
 
     lseek(fd, 0, SEEK_SET);
     if (e_ident[EI_CLASS] == ELFCLASS64) {
-        ret = load_elf64(filename, fd, translate_fn, translate_opaque, must_swab,
-                         pentry, lowaddr, highaddr, elf_machine, clear_lsb,
-                         data_swab, as, load_rom, sym_cb);
+        ret = load_elf64(filename, fd, elf_note_fn,
+                         translate_fn, translate_opaque, must_swab,
+                         pentry, lowaddr, highaddr, pflags, elf_machine,
+                         clear_lsb, data_swab, as, load_rom, sym_cb);
     } else {
-        ret = load_elf32(filename, fd, translate_fn, translate_opaque, must_swab,
-                         pentry, lowaddr, highaddr, elf_machine, clear_lsb,
-                         data_swab, as, load_rom, sym_cb);
+        ret = load_elf32(filename, fd, elf_note_fn,
+                         translate_fn, translate_opaque, must_swab,
+                         pentry, lowaddr, highaddr, pflags, elf_machine,
+                         clear_lsb, data_swab, as, load_rom, sym_cb);
     }
 
  fail:
@@ -565,24 +559,35 @@ ssize_t gunzip(void *dst, size_t dstlen, uint8_t *src, size_t srclen)
 
     /* skip header */
     i = 10;
+    if (srclen < 4) {
+        goto toosmall;
+    }
     flags = src[3];
     if (src[2] != DEFLATED || (flags & RESERVED) != 0) {
         puts ("Error: Bad gzipped data\n");
         return -1;
     }
-    if ((flags & EXTRA_FIELD) != 0)
+    if ((flags & EXTRA_FIELD) != 0) {
+        if (srclen < 12) {
+            goto toosmall;
+        }
         i = 12 + src[10] + (src[11] << 8);
-    if ((flags & ORIG_NAME) != 0)
-        while (src[i++] != 0)
-            ;
-    if ((flags & COMMENT) != 0)
-        while (src[i++] != 0)
-            ;
-    if ((flags & HEAD_CRC) != 0)
+    }
+    if ((flags & ORIG_NAME) != 0) {
+        while (i < srclen && src[i++] != 0) {
+            /* do nothing */
+        }
+    }
+    if ((flags & COMMENT) != 0) {
+        while (i < srclen && src[i++] != 0) {
+            /* do nothing */
+        }
+    }
+    if ((flags & HEAD_CRC) != 0) {
         i += 2;
+    }
     if (i >= srclen) {
-        puts ("Error: gunzip out of data in header\n");
-        return -1;
+        goto toosmall;
     }
 
     s.zalloc = zalloc;
@@ -606,6 +611,10 @@ ssize_t gunzip(void *dst, size_t dstlen, uint8_t *src, size_t srclen)
     inflateEnd(&s);
 
     return dstbytes;
+
+toosmall:
+    puts("Error: gunzip out of data in header\n");
+    return -1;
 }
 
 /* Load a U-Boot image.  */
@@ -638,13 +647,26 @@ static int load_uboot_image(const char *filename, hwaddr *ep, hwaddr *loadaddr,
         goto out;
 
     if (hdr->ih_type != image_type) {
-        fprintf(stderr, "Wrong image type %d, expected %d\n", hdr->ih_type,
-                image_type);
-        goto out;
+        if (!(image_type == IH_TYPE_KERNEL &&
+            hdr->ih_type == IH_TYPE_KERNEL_NOLOAD)) {
+            fprintf(stderr, "Wrong image type %d, expected %d\n", hdr->ih_type,
+                    image_type);
+            goto out;
+        }
     }
 
     /* TODO: Implement other image types.  */
     switch (hdr->ih_type) {
+    case IH_TYPE_KERNEL_NOLOAD:
+        if (!loadaddr || *loadaddr == LOAD_UIMAGE_LOADADDR_INVALID) {
+            fprintf(stderr, "this image format (kernel_noload) cannot be "
+                    "loaded on this machine type");
+            goto out;
+        }
+
+        hdr->ih_load = *loadaddr + sizeof(*hdr);
+        hdr->ih_ep += hdr->ih_load;
+        /* fall through */
     case IH_TYPE_KERNEL:
         address = hdr->ih_load;
         if (translate_fn) {
@@ -840,6 +862,7 @@ struct Rom {
     int isrom;
     char *fw_dir;
     char *fw_file;
+    GMappedFile *mapped_file;
 
     bool committed;
 
@@ -850,10 +873,25 @@ struct Rom {
 static FWCfgState *fw_cfg;
 static QTAILQ_HEAD(, Rom) roms = QTAILQ_HEAD_INITIALIZER(roms);
 
-/* rom->data must be heap-allocated (do not use with rom_add_elf_program()) */
+/*
+ * rom->data can be heap-allocated or memory-mapped (e.g. when added with
+ * rom_add_elf_program())
+ */
+static void rom_free_data(Rom *rom)
+{
+    if (rom->mapped_file) {
+        g_mapped_file_unref(rom->mapped_file);
+        rom->mapped_file = NULL;
+    } else {
+        g_free(rom->data);
+    }
+
+    rom->data = NULL;
+}
+
 static void rom_free(Rom *rom)
 {
-    g_free(rom->data);
+    rom_free_data(rom);
     g_free(rom->path);
     g_free(rom->name);
     g_free(rom->fw_dir);
@@ -1030,6 +1068,7 @@ MemoryRegion *rom_add_blob(const char *name, const void *blob, size_t len,
     rom->addr     = addr;
     rom->romsize  = max_len ? max_len : len;
     rom->datasize = len;
+    g_assert(rom->romsize >= rom->datasize);
     rom->data     = g_malloc0(rom->datasize);
     memcpy(rom->data, blob, len);
     rom_insert(rom);
@@ -1059,11 +1098,12 @@ MemoryRegion *rom_add_blob(const char *name, const void *blob, size_t len,
 
 /* This function is specific for elf program because we don't need to allocate
  * all the rom. We just allocate the first part and the rest is just zeros. This
- * is why romsize and datasize are different. Also, this function seize the
- * memory ownership of "data", so we don't have to allocate and copy the buffer.
+ * is why romsize and datasize are different. Also, this function takes its own
+ * reference to "mapped_file", so we don't have to allocate and copy the buffer.
  */
-int rom_add_elf_program(const char *name, void *data, size_t datasize,
-                        size_t romsize, hwaddr addr, AddressSpace *as)
+int rom_add_elf_program(const char *name, GMappedFile *mapped_file, void *data,
+                        size_t datasize, size_t romsize, hwaddr addr,
+                        AddressSpace *as)
 {
     Rom *rom;
 
@@ -1074,6 +1114,12 @@ int rom_add_elf_program(const char *name, void *data, size_t datasize,
     rom->romsize  = romsize;
     rom->data     = data;
     rom->as       = as;
+
+    if (mapped_file && data) {
+        g_mapped_file_ref(mapped_file);
+        rom->mapped_file = mapped_file;
+    }
+
     rom_insert(rom);
     return 0;
 }
@@ -1096,20 +1142,39 @@ static void rom_reset(void *unused)
         if (rom->fw_file) {
             continue;
         }
+        /*
+         * We don't need to fill in the RAM with ROM data because we'll fill
+         * the data in during the next incoming migration in all cases.  Note
+         * that some of those RAMs can actually be modified by the guest.
+         */
+        if (runstate_check(RUN_STATE_INMIGRATE)) {
+            if (rom->data && rom->isrom) {
+                /*
+                 * Free it so that a rom_reset after migration doesn't
+                 * overwrite a potentially modified 'rom'.
+                 */
+                rom_free_data(rom);
+            }
+            continue;
+        }
+
         if (rom->data == NULL) {
             continue;
         }
         if (rom->mr) {
             void *host = memory_region_get_ram_ptr(rom->mr);
             memcpy(host, rom->data, rom->datasize);
+            memset(host + rom->datasize, 0, rom->romsize - rom->datasize);
         } else {
-            cpu_physical_memory_write_rom(rom->as, rom->addr, rom->data,
-                                          rom->datasize);
+            address_space_write_rom(rom->as, rom->addr, MEMTXATTRS_UNSPECIFIED,
+                                    rom->data, rom->datasize);
+            address_space_set(rom->as, rom->addr + rom->datasize, 0,
+                              rom->romsize - rom->datasize,
+                              MEMTXATTRS_UNSPECIFIED);
         }
         if (rom->isrom) {
             /* rom needs to be written only once */
-            g_free(rom->data);
-            rom->data = NULL;
+            rom_free_data(rom);
         }
         /*
          * The rom loader is really on the same level as firmware in the guest
@@ -1118,37 +1183,82 @@ static void rom_reset(void *unused)
          * CPU definitely fetches its instructions from the just written data.
          */
         cpu_flush_icache_range(rom->addr, rom->datasize);
+
+        trace_loader_write_rom(rom->name, rom->addr, rom->datasize, rom->isrom);
     }
+}
+
+/* Return true if two consecutive ROMs in the ROM list overlap */
+static bool roms_overlap(Rom *last_rom, Rom *this_rom)
+{
+    if (!last_rom) {
+        return false;
+    }
+    return last_rom->as == this_rom->as &&
+        last_rom->addr + last_rom->romsize > this_rom->addr;
+}
+
+static const char *rom_as_name(Rom *rom)
+{
+    const char *name = rom->as ? rom->as->name : NULL;
+    return name ?: "anonymous";
+}
+
+static void rom_print_overlap_error_header(void)
+{
+    error_report("Some ROM regions are overlapping");
+    error_printf(
+        "These ROM regions might have been loaded by "
+        "direct user request or by default.\n"
+        "They could be BIOS/firmware images, a guest kernel, "
+        "initrd or some other file loaded into guest memory.\n"
+        "Check whether you intended to load all this guest code, and "
+        "whether it has been built to load to the correct addresses.\n");
+}
+
+static void rom_print_one_overlap_error(Rom *last_rom, Rom *rom)
+{
+    error_printf(
+        "\nThe following two regions overlap (in the %s address space):\n",
+        rom_as_name(rom));
+    error_printf(
+        "  %s (addresses 0x" TARGET_FMT_plx " - 0x" TARGET_FMT_plx ")\n",
+        last_rom->name, last_rom->addr, last_rom->addr + last_rom->romsize);
+    error_printf(
+        "  %s (addresses 0x" TARGET_FMT_plx " - 0x" TARGET_FMT_plx ")\n",
+        rom->name, rom->addr, rom->addr + rom->romsize);
 }
 
 int rom_check_and_register_reset(void)
 {
-    hwaddr addr = 0;
     MemoryRegionSection section;
-    Rom *rom;
-    AddressSpace *as = NULL;
+    Rom *rom, *last_rom = NULL;
+    bool found_overlap = false;
 
     QTAILQ_FOREACH(rom, &roms, next) {
         if (rom->fw_file) {
             continue;
         }
         if (!rom->mr) {
-            if ((addr > rom->addr) && (as == rom->as)) {
-                fprintf(stderr, "rom: requested regions overlap "
-                        "(rom %s. free=0x" TARGET_FMT_plx
-                        ", addr=0x" TARGET_FMT_plx ")\n",
-                        rom->name, addr, rom->addr);
-                return -1;
+            if (roms_overlap(last_rom, rom)) {
+                if (!found_overlap) {
+                    found_overlap = true;
+                    rom_print_overlap_error_header();
+                }
+                rom_print_one_overlap_error(last_rom, rom);
+                /* Keep going through the list so we report all overlaps */
             }
-            addr  = rom->addr;
-            addr += rom->romsize;
-            as = rom->as;
+            last_rom = rom;
         }
         section = memory_region_find(rom->mr ? rom->mr : get_system_memory(),
                                      rom->addr, 1);
         rom->isrom = int128_nz(section.size) && memory_region_is_rom(section.mr);
         memory_region_unref(section.mr);
     }
+    if (found_overlap) {
+        return -1;
+    }
+
     qemu_register_reset(rom_reset, NULL);
     roms_loaded = 1;
     return 0;
@@ -1223,6 +1333,92 @@ static Rom *find_rom(hwaddr addr, size_t size)
     return NULL;
 }
 
+typedef struct RomSec {
+    hwaddr base;
+    int se; /* start/end flag */
+} RomSec;
+
+
+/*
+ * Sort into address order. We break ties between rom-startpoints
+ * and rom-endpoints in favour of the startpoint, by sorting the 0->1
+ * transition before the 1->0 transition. Either way round would
+ * work, but this way saves a little work later by avoiding
+ * dealing with "gaps" of 0 length.
+ */
+static gint sort_secs(gconstpointer a, gconstpointer b)
+{
+    RomSec *ra = (RomSec *) a;
+    RomSec *rb = (RomSec *) b;
+
+    if (ra->base == rb->base) {
+        return ra->se - rb->se;
+    }
+    return ra->base > rb->base ? 1 : -1;
+}
+
+static GList *add_romsec_to_list(GList *secs, hwaddr base, int se)
+{
+   RomSec *cand = g_new(RomSec, 1);
+   cand->base = base;
+   cand->se = se;
+   return g_list_prepend(secs, cand);
+}
+
+RomGap rom_find_largest_gap_between(hwaddr base, size_t size)
+{
+    Rom *rom;
+    RomSec *cand;
+    RomGap res = {0, 0};
+    hwaddr gapstart = base;
+    GList *it, *secs = NULL;
+    int count = 0;
+
+    QTAILQ_FOREACH(rom, &roms, next) {
+        /* Ignore blobs being loaded to special places */
+        if (rom->mr || rom->fw_file) {
+            continue;
+        }
+        /* ignore anything finishing bellow base */
+        if (rom->addr + rom->romsize <= base) {
+            continue;
+        }
+        /* ignore anything starting above the region */
+        if (rom->addr >= base + size) {
+            continue;
+        }
+
+        /* Save the start and end of each relevant ROM */
+        secs = add_romsec_to_list(secs, rom->addr, 1);
+
+        if (rom->addr + rom->romsize < base + size) {
+            secs = add_romsec_to_list(secs, rom->addr + rom->romsize, -1);
+        }
+    }
+
+    /* sentinel */
+    secs = add_romsec_to_list(secs, base + size, 1);
+
+    secs = g_list_sort(secs, sort_secs);
+
+    for (it = g_list_first(secs); it; it = g_list_next(it)) {
+        cand = (RomSec *) it->data;
+        if (count == 0 && count + cand->se == 1) {
+            size_t gap = cand->base - gapstart;
+            if (gap > res.size) {
+                res.base = gapstart;
+                res.size = gap;
+            }
+        } else if (count == 1 && count + cand->se == 0) {
+            gapstart = cand->base;
+        }
+        count += cand->se;
+    }
+
+    g_list_free_full(secs, g_free);
+    return res;
+}
+
 /*
  * Copies memory from registered ROMs to dest. Any memory that is contained in
  * a ROM between addr and addr + size is copied. Note that this can involve
@@ -1245,7 +1441,7 @@ int rom_copy(uint8_t *dest, hwaddr addr, size_t size)
         if (rom->addr + rom->romsize < addr) {
             continue;
         }
-        if (rom->addr > end) {
+        if (rom->addr > end || rom->addr < addr) {
             break;
         }
 
@@ -1295,32 +1491,110 @@ void *rom_ptr(hwaddr addr, size_t size)
     return rom->data + (addr - rom->addr);
 }
 
-void hmp_info_roms(Monitor *mon, const QDict *qdict)
+typedef struct FindRomCBData {
+    size_t size; /* Amount of data we want from ROM, in bytes */
+    MemoryRegion *mr; /* MR at the unaliased guest addr */
+    hwaddr xlat; /* Offset of addr within mr */
+    void *rom; /* Output: rom data pointer, if found */
+} FindRomCBData;
+
+static bool find_rom_cb(Int128 start, Int128 len, const MemoryRegion *mr,
+                        hwaddr offset_in_region, void *opaque)
+{
+    FindRomCBData *cbdata = opaque;
+    hwaddr alias_addr;
+
+    if (mr != cbdata->mr) {
+        return false;
+    }
+
+    alias_addr = int128_get64(start) + cbdata->xlat - offset_in_region;
+    cbdata->rom = rom_ptr(alias_addr, cbdata->size);
+    if (!cbdata->rom) {
+        return false;
+    }
+    /* Found a match, stop iterating */
+    return true;
+}
+
+void *rom_ptr_for_as(AddressSpace *as, hwaddr addr, size_t size)
+{
+    /*
+     * Find any ROM data for the given guest address range.  If there
+     * is a ROM blob then return a pointer to the host memory
+     * corresponding to 'addr'; otherwise return NULL.
+     *
+     * We look not only for ROM blobs that were loaded directly to
+     * addr, but also for ROM blobs that were loaded to aliases of
+     * that memory at other addresses within the AddressSpace.
+     *
+     * Note that we do not check @as against the 'as' member in the
+     * 'struct Rom' returned by rom_ptr(). The Rom::as is the
+     * AddressSpace which the rom blob should be written to, whereas
+     * our @as argument is the AddressSpace which we are (effectively)
+     * reading from, and the same underlying RAM will often be visible
+     * in multiple AddressSpaces. (A common example is a ROM blob
+     * written to the 'system' address space but then read back via a
+     * CPU's cpu->as pointer.) This does mean we might potentially
+     * return a false-positive match if a ROM blob was loaded into an
+     * AS which is entirely separate and distinct from the one we're
+     * querying, but this issue exists also for rom_ptr() and hasn't
+     * caused any problems in practice.
+     */
+    FlatView *fv;
+    void *rom;
+    hwaddr len_unused;
+    FindRomCBData cbdata = {};
+
+    /* Easy case: there's data at the actual address */
+    rom = rom_ptr(addr, size);
+    if (rom) {
+        return rom;
+    }
+
+    RCU_READ_LOCK_GUARD();
+
+    fv = address_space_to_flatview(as);
+    cbdata.mr = flatview_translate(fv, addr, &cbdata.xlat, &len_unused,
+                                   false, MEMTXATTRS_UNSPECIFIED);
+    if (!cbdata.mr) {
+        /* Nothing at this address, so there can't be any aliasing */
+        return NULL;
+    }
+    cbdata.size = size;
+    flatview_for_each_range(fv, find_rom_cb, &cbdata);
+    return cbdata.rom;
+}
+
+HumanReadableText *qmp_x_query_roms(Error **errp)
 {
     Rom *rom;
+    g_autoptr(GString) buf = g_string_new("");
 
     QTAILQ_FOREACH(rom, &roms, next) {
         if (rom->mr) {
-            monitor_printf(mon, "%s"
-                           " size=0x%06zx name=\"%s\"\n",
-                           memory_region_name(rom->mr),
-                           rom->romsize,
-                           rom->name);
+            g_string_append_printf(buf, "%s"
+                                   " size=0x%06zx name=\"%s\"\n",
+                                   memory_region_name(rom->mr),
+                                   rom->romsize,
+                                   rom->name);
         } else if (!rom->fw_file) {
-            monitor_printf(mon, "addr=" TARGET_FMT_plx
-                           " size=0x%06zx mem=%s name=\"%s\"\n",
-                           rom->addr, rom->romsize,
-                           rom->isrom ? "rom" : "ram",
-                           rom->name);
+            g_string_append_printf(buf, "addr=" TARGET_FMT_plx
+                                   " size=0x%06zx mem=%s name=\"%s\"\n",
+                                   rom->addr, rom->romsize,
+                                   rom->isrom ? "rom" : "ram",
+                                   rom->name);
         } else {
-            monitor_printf(mon, "fw=%s/%s"
-                           " size=0x%06zx name=\"%s\"\n",
-                           rom->fw_dir,
-                           rom->fw_file,
-                           rom->romsize,
-                           rom->name);
+            g_string_append_printf(buf, "fw=%s/%s"
+                                   " size=0x%06zx name=\"%s\"\n",
+                                   rom->fw_dir,
+                                   rom->fw_file,
+                                   rom->romsize,
+                                   rom->name);
         }
     }
+
+    return human_readable_text_from_str(buf);
 }
 
 typedef enum HexRecord HexRecord;
@@ -1403,6 +1677,7 @@ typedef struct {
     uint32_t current_rom_index;
     uint32_t rom_start_address;
     AddressSpace *as;
+    bool complete;
 } HexParser;
 
 /* return size or -1 if error */
@@ -1440,6 +1715,7 @@ static int handle_record_type(HexParser *parser)
                                   parser->current_rom_index,
                                   parser->rom_start_address, parser->as);
         }
+        parser->complete = true;
         return parser->total_size;
     case EXT_SEG_ADDR_RECORD:
     case EXT_LINEAR_ADDR_RECORD:
@@ -1504,11 +1780,12 @@ static int parse_hex_blob(const char *filename, hwaddr *addr, uint8_t *hex_blob,
         .bin_buf = g_malloc(hex_blob_size),
         .start_addr = addr,
         .as = as,
+        .complete = false
     };
 
     rom_transaction_begin();
 
-    for (; hex_blob < end; ++hex_blob) {
+    for (; hex_blob < end && !parser.complete; ++hex_blob) {
         switch (*hex_blob) {
         case '\r':
         case '\n':
