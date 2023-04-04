@@ -18,10 +18,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qemu/help-texts.h"
 #include "qemu/units.h"
 #include "qemu/accel.h"
-#include "sysemu/tcg.h"
 #include "qemu-version.h"
 #include <sys/syscall.h>
 #include <sys/resource.h>
@@ -56,6 +55,10 @@
 #include "loader.h"
 #include "user-mmap.h"
 
+#ifdef CONFIG_SEMIHOSTING
+#include "semihosting/semihost.h"
+#endif
+
 #ifndef AT_FLAGS_PRESERVE_ARGV0
 #define AT_FLAGS_PRESERVE_ARGV0_BIT 0
 #define AT_FLAGS_PRESERVE_ARGV0 (1 << AT_FLAGS_PRESERVE_ARGV0_BIT)
@@ -86,6 +89,7 @@ static bool enable_strace;
  * Used to support command line arguments overriding environment variables.
  */
 static int last_log_mask;
+static const char *last_log_filename;
 
 /*
  * When running 32-on-64 we should make sure we can fit all of the possible
@@ -121,10 +125,14 @@ static void usage(int exitcode);
 static const char *interp_prefix = CONFIG_QEMU_INTERP_PREFIX;
 const char *qemu_uname_release;
 
+#if !defined(TARGET_DEFAULT_STACK_SIZE)
 /* XXX: on x86 MAP_GROWSDOWN only works if ESP <= address + 32, so
    we allocate a bigger stack. Need a better solution, for example
    by remapping the process stack directly at the right place */
-unsigned long guest_stack_size = 8 * 1024 * 1024UL;
+#define TARGET_DEFAULT_STACK_SIZE	8 * 1024 * 1024UL
+#endif
+
+unsigned long guest_stack_size = TARGET_DEFAULT_STACK_SIZE;
 
 /***********************************************************/
 /* Helper routines for implementing atomic operations.  */
@@ -135,10 +143,12 @@ void fork_start(void)
     start_exclusive();
     mmap_fork_start();
     cpu_list_lock();
+    qemu_plugin_user_prefork_lock();
 }
 
 void fork_end(int child)
 {
+    qemu_plugin_user_postfork(child);
     mmap_fork_end(child);
     if (child) {
         CPUState *cpu, *next_cpu;
@@ -258,7 +268,7 @@ static void handle_arg_dfilter(const char *arg)
 
 static void handle_arg_log_filename(const char *arg)
 {
-    qemu_set_log_filename(arg, &error_fatal);
+    last_log_filename = arg;
 }
 
 static void handle_arg_set_env(const char *arg)
@@ -333,89 +343,6 @@ static void handle_arg_gdb(const char *arg)
 static void handle_arg_uname(const char *arg)
 {
     qemu_uname_release = strdup(arg);
-}
-
-static void handle_arg_count_ifetch(const char *arg)
-{
-    count_ifetch |= 0x1;
-}
-
-/* Count the number of fetched instructions.  */
-int count_ifetch = 0;
-
-static FILE *output_ifetch;
-void initialize_ifetch(void)
-{
-    if (!(count_ifetch & 0x1))
-        return;
-    output_ifetch = fdopen(dup(fileno(stderr)), "a");
-    if (!output_ifetch) output_ifetch = stderr;
-}
-
-void show_all_ifetch_counters(void)
-{
-    CPUState *cpu;
-
-    /* Print the result only if the -count-ifetch option was passed to
-     * the command-line.  */
-    if (!(count_ifetch & 0x1))
-        return;
-
-    CPU_FOREACH(cpu) {
-        fprintf(output_ifetch,
-                "qemu: number of fetched instructions on CPU #%d = %" PRIu64 "\n",
-                cpu->cpu_index, cpu->ifetch_counter);
-    }
-}
-
-/* Number of fetched instructions per second.  */
-uint64_t clock_ifetch = 0;
-
-uint64_t convert_string_to_frequency(const char *string)
-{
-    uint64_t factor;
-    char *not_a_number;
-    const char *cause;
-    unsigned long long int frequency;
-
-    frequency = strtoull(string, &not_a_number, 10);
-    if (!frequency) {
-        cause = "there's no digits in the initial part";
-        goto error;
-    }
-
-    if (not_a_number[0] == '\0' || !strcasecmp(not_a_number, "Hz")) {
-        factor = 1;
-    } else if (!strcasecmp(not_a_number, "KHz")) {
-        factor = 1000;
-    } else if (!strcasecmp(not_a_number, "MHz")) {
-        factor = 1000*1000;
-    } else if (!strcasecmp(not_a_number, "GHz")) {
-        factor = 1000*1000*1000;
-    } else {
-        cause = "the frequency unit is unknown";
-        goto error;
-    }
-
-    if (frequency >= UINT64_MAX / factor) {
-        fprintf(stderr, "qemu: frequency value \"%s\" overflows a "
-                "64-bit unsigned integer, limiting it to %" PRIu64 ".\n",
-                string, UINT64_MAX);
-        frequency = UINT64_MAX;
-        factor = 1;
-    }
-
-    return frequency * factor;
-
-error:
-    fprintf(stderr, "qemu: frequency value \"%s\" is invalid, %s.\n", string, cause);
-    exit(1);
-}
-
-static void handle_arg_clock_ifetch(const char *arg)
-{
-    count_ifetch |= 0x2;
-    clock_ifetch = convert_string_to_frequency(arg);
 }
 
 #ifdef CONFIG_TCG_PLUGIN
@@ -543,10 +470,6 @@ static const struct qemu_argument arg_table[] = {
      "argv0",      "forces target process argv[0] to be 'argv0'"},
     {"r",          "QEMU_UNAME",       true,  handle_arg_uname,
      "uname",      "set qemu uname release string to 'uname'"},
-    {"count-ifetch", "QEMU_COUNT_IFETCH", false,  handle_arg_count_ifetch,
-     "",           "count the number of fetched instructions"},
-    {"clock-ifetch", "QEMU_CLOCK_IFETCH", true,  handle_arg_clock_ifetch,
-     "freq",       "make user-time related syscalls return f(ifetch / freq)"},
 #ifdef CONFIG_TCG_PLUGIN
     {"tcg-plugin", "QEMU_TCG_PLUGIN", true,  handle_arg_tcg_plugin,
      "dso",        "load the dynamic shared object as TCG plugin"},
@@ -742,7 +665,6 @@ int main(int argc, char **argv, char **envp)
     int i;
     int ret;
     int execfd;
-    int log_mask;
     unsigned long max_reserved_va;
     bool preserve_argv0;
 
@@ -764,7 +686,8 @@ int main(int argc, char **argv, char **envp)
         struct rlimit lim;
         if (getrlimit(RLIMIT_STACK, &lim) == 0
             && lim.rlim_cur != RLIM_INFINITY
-            && lim.rlim_cur == (target_long)lim.rlim_cur) {
+            && lim.rlim_cur == (target_long)lim.rlim_cur
+            && lim.rlim_cur > guest_stack_size) {
             guest_stack_size = lim.rlim_cur;
         }
     }
@@ -776,11 +699,9 @@ int main(int argc, char **argv, char **envp)
 
     optind = parse_args(argc, argv);
 
-    log_mask = last_log_mask | (enable_strace ? LOG_STRACE : 0);
-    if (log_mask) {
-        qemu_log_needs_buffers();
-        qemu_set_log(log_mask);
-    }
+    qemu_set_log_filename_flags(last_log_filename,
+                                last_log_mask | (enable_strace * LOG_STRACE),
+                                &error_fatal);
 
     if (!trace_init_backends()) {
         exit(1);
@@ -957,21 +878,36 @@ int main(int argc, char **argv, char **envp)
     g_free(target_environ);
 
     if (qemu_loglevel_mask(CPU_LOG_PAGE)) {
-        qemu_log("guest_base  %p\n", (void *)guest_base);
-        log_page_dump("binary load");
+        FILE *f = qemu_log_trylock();
+        if (f) {
+            fprintf(f, "guest_base  %p\n", (void *)guest_base);
+            fprintf(f, "page layout changed following binary load\n");
+            page_dump(f);
 
-        qemu_log("start_brk   0x" TARGET_ABI_FMT_lx "\n", info->start_brk);
-        qemu_log("end_code    0x" TARGET_ABI_FMT_lx "\n", info->end_code);
-        qemu_log("start_code  0x" TARGET_ABI_FMT_lx "\n", info->start_code);
-        qemu_log("start_data  0x" TARGET_ABI_FMT_lx "\n", info->start_data);
-        qemu_log("end_data    0x" TARGET_ABI_FMT_lx "\n", info->end_data);
-        qemu_log("start_stack 0x" TARGET_ABI_FMT_lx "\n", info->start_stack);
-        qemu_log("brk         0x" TARGET_ABI_FMT_lx "\n", info->brk);
-        qemu_log("entry       0x" TARGET_ABI_FMT_lx "\n", info->entry);
-        qemu_log("argv_start  0x" TARGET_ABI_FMT_lx "\n", info->arg_start);
-        qemu_log("env_start   0x" TARGET_ABI_FMT_lx "\n",
-                 info->arg_end + (abi_ulong)sizeof(abi_ulong));
-        qemu_log("auxv_start  0x" TARGET_ABI_FMT_lx "\n", info->saved_auxv);
+            fprintf(f, "start_brk   0x" TARGET_ABI_FMT_lx "\n",
+                    info->start_brk);
+            fprintf(f, "end_code    0x" TARGET_ABI_FMT_lx "\n",
+                    info->end_code);
+            fprintf(f, "start_code  0x" TARGET_ABI_FMT_lx "\n",
+                    info->start_code);
+            fprintf(f, "start_data  0x" TARGET_ABI_FMT_lx "\n",
+                    info->start_data);
+            fprintf(f, "end_data    0x" TARGET_ABI_FMT_lx "\n",
+                    info->end_data);
+            fprintf(f, "start_stack 0x" TARGET_ABI_FMT_lx "\n",
+                    info->start_stack);
+            fprintf(f, "brk         0x" TARGET_ABI_FMT_lx "\n",
+                    info->brk);
+            fprintf(f, "entry       0x" TARGET_ABI_FMT_lx "\n",
+                    info->entry);
+            fprintf(f, "argv_start  0x" TARGET_ABI_FMT_lx "\n",
+                    info->argv);
+            fprintf(f, "env_start   0x" TARGET_ABI_FMT_lx "\n",
+                    info->envp);
+            fprintf(f, "auxv_start  0x" TARGET_ABI_FMT_lx "\n",
+                    info->saved_auxv);
+            qemu_log_unlock(f);
+        }
     }
 
     target_set_brk(info->brk);
@@ -984,7 +920,6 @@ int main(int argc, char **argv, char **envp)
     tcg_prologue_init(tcg_ctx);
 
     target_cpu_copy_regs(env, regs);
-    initialize_ifetch();
     /* initialize plugins to allow tpi_init to be called.
      * Allows plugin to declare their parameters. */
     qemu_init_exec_dir(argv[0]);
@@ -998,6 +933,11 @@ int main(int argc, char **argv, char **envp)
         }
         gdb_handlesig(cpu, 0);
     }
+
+#ifdef CONFIG_SEMIHOSTING
+    qemu_semihosting_guestfd_init();
+#endif
+
     cpu_loop(env);
     /* never exits */
     return 0;

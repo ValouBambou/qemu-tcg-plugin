@@ -44,6 +44,8 @@
 #include "tcg-plugin.h"
 #include "sysemu/sysemu.h"   /* max_cpus */
 #include "qemu/log.h"        /* qemu_set_log() */
+#include "qapi/error.h"      /* error_fatal */
+#include "qemu/cutils.h"     /* qemu_get_exec_dir() */
 
 #if defined(CONFIG_USER_ONLY)
 extern const char *exec_path;
@@ -590,7 +592,7 @@ static void tcg_plugin_state_init(void)
     /* No TB chain with plugins as we must have an up to date
      * env->current_tb for the plugin interface.
      */
-    qemu_set_log(CPU_LOG_TB_NOCHAIN);
+    qemu_set_log(CPU_LOG_TB_NOCHAIN, &error_fatal);
 
     /* Plugins output is, in order of priority:
      *

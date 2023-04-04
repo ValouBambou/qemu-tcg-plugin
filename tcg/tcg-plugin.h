@@ -34,7 +34,6 @@
 
 #include <glib.h>
 
-#include "qemu-common.h"
 #include "hw/core/cpu.h"
 
 #include "tcg/tcg.h"
