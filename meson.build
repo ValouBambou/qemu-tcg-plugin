@@ -3367,7 +3367,7 @@ foreach target : target_dirs
     emulator = executable(exe_name, exe['sources'],
                install: true,
                c_args: c_args,
-               dependencies: arch_deps + deps + exe['dependencies'] + dl,
+               dependencies: arch_deps + deps + exe['dependencies'] + [dl],
                objects: lib.extract_all_objects(recursive: true),
                link_language: link_language,
                link_depends: [block_syms, qemu_syms] + exe.get('link_depends', []),
