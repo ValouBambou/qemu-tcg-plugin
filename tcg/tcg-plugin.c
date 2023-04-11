@@ -1034,7 +1034,12 @@ static void tcg_plugin_tpi_before_gen_tb(TCGPluginInterface *tpi,
         return;
     }
 
-    assert(!tpi->_in_gen_tpi_helper);
+    /* Due to sigsetjmp/siglongjmp based retry in translate-all.c,
+       the plugins interface can be re-entered there while the
+       TB translation was not completed.
+       Hence, for this function we force _in_gen_tpi_helper flag, while
+       for other plugin functions we assert that it is correctly nested.
+    */
     tpi->_in_gen_tpi_helper = true;
 
     if (tpi->before_gen_tb) {
