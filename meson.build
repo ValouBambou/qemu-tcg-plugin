@@ -3492,7 +3492,7 @@ foreach target : target_dirs
   if 'CONFIG_TCG_PLUGIN_CPP' in config_host
     libcpp_plugin = shared_library('tcg-plugin-cpp',
       build_by_default: true,
-      sources: tcg_cpp_plugin_src,
+      sources: tcg_cpp_plugin_src + genh,
       dependencies: [capstone, libelf, libdwarf],
       c_args: tcg_plugin_carg + c_args,
       cpp_args: tcg_cpp_plugin_carg,
@@ -3502,10 +3502,11 @@ foreach target : target_dirs
       install_dir: tcg_plugin_install_dir / target_name / target_type
     )
   endif
+
   if 'CONFIG_TCG_PLUGIN' in config_host
     libdinero_plugin = shared_library('tcg-plugin-dineroIV',
       build_by_default: true,
-      sources: dinero_plugin_src,
+      sources: dinero_plugin_src + genh,
       link_with: libdinero,
       c_args: tcg_plugin_carg + c_args,
       link_args : tcg_plugin_link_arg,
@@ -3516,7 +3517,7 @@ foreach target : target_dirs
 
     libdyncount_plugin = shared_library('tcg-plugin-dyncount',
       build_by_default: true,
-      sources: dyncount_plugin_src,
+      sources: dyncount_plugin_src + genh,
       dependencies: capstone,
       c_args: tcg_plugin_carg + c_args,
       link_args : tcg_plugin_link_arg,
@@ -3527,7 +3528,7 @@ foreach target : target_dirs
 
     libdyntrace_plugin = shared_library('tcg-plugin-dyntrace',
       build_by_default: true,
-      sources: dyntrace_plugin_src,
+      sources: dyntrace_plugin_src + genh,
       dependencies: capstone,
       c_args: tcg_plugin_carg + c_args,
       link_args : tcg_plugin_link_arg,
@@ -3538,7 +3539,7 @@ foreach target : target_dirs
 
     libcoverage_plugin = shared_library('tcg-plugin-coverage',
       build_by_default: true,
-      sources: coverage_plugin_src,
+      sources: coverage_plugin_src + genh,
       dependencies: capstone,
       c_args: tcg_plugin_carg + c_args,
       link_args : tcg_plugin_link_arg,
@@ -3554,7 +3555,7 @@ foreach target : target_dirs
 
       lib_plugin = shared_library('tcg-plugin-' + pl,
         build_by_default: true,
-        sources: tcg_plugin_src,
+        sources: tcg_plugin_src + genh,
         c_args: tcg_plugin_carg + c_args,
         link_args : tcg_plugin_link_arg,
         include_directories: target_inc,
