@@ -74,7 +74,7 @@ public:
         // disassemble whole symbol
         while (cs_disasm_iter(handle, &code, &size, &pc, cs_inst.get())) {
             uint64_t i_pc = cs_inst->address;
-            const instruction& i = get_instruction(i_pc, std::move(cs_inst));
+            const instruction i = std::move(get_instruction(i_pc, std::move(cs_inst)));
             uint64_t count = hits[i.pc()];
             const source_line* line = i.line();
             std::string source;
