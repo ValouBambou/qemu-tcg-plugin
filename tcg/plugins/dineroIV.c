@@ -55,6 +55,7 @@ static uint32_t output_flags;
 #define OUTPUT_TRACE     (1U<<4)
 #define OUTPUT_DINERO    (1U<<5)
 #define OUTPUT_YAML      (1U<<6)
+#define OUTPUT_TRACE_BIN (1U<<7)
 #define OUTPUTS_LEGACY_1 (OUTPUT_COPYRIGHT|OUTPUT_TRACE)
 #define OUTPUTS_LEGACY_2 (OUTPUT_STATS|OUTPUT_CYCLES)
 #define OUTPUTS_DEFAULT  (OUTPUT_STATS|OUTPUT_CYCLES|OUTPUT_YAML)
@@ -147,7 +148,17 @@ static void after_exec_opc(uint64_t info_data, uint64_t address, uint64_t pc)
         if (info.type == 'i') address = pc;
         fprintf(output, "%c 0x%016" PRIx64 " 0x%08" PRIx32 " (0x%016" PRIx64 ") CPU #%" PRIu32 " 0x%016" PRIx64 "\n",
                 info.type, address, info.size, (uint64_t)0, info.cpu_index, pc);
+    } else if (output_flags & OUTPUT_TRACE_BIN) {
+      char memref[8+2+1];
+      if (info.type == 'i') address = pc;
+      /* Stores as little endian. */
+      memref[0] = (char)(((uint64_t)address) & 0xff); memref[1] = (char)(((uint64_t)address >> 8) & 0xff); memref[2] = (char)(((uint64_t)address >> 16) & 0xff); memref[3] = (char)(((uint64_t)address >> 24) & 0xff);
+      memref[4] = (char)(((uint64_t)address >> 32) & 0xff); memref[5] = (char)(((uint64_t)address >> 40) & 0xff); memref[6] = (char)(((uint64_t)address >> 48) & 0xff); memref[7] = (char)(((uint64_t)address >> 56) & 0xff);
+      memref[8] = (char)(((uint16_t)info.size) & 0xff); memref[9] = (char)(((uint16_t)info.size >> 8) & 0xff);
+      memref[10] = info.type;
+      fwrite(&memref, sizeof(memref), 1, output);
     }
+
 }
 
 static void gen_helper(const TCGPluginInterface *tpi, TCGArg *opargs, int type, uint16_t size, uint64_t pc, int cpu_index);
@@ -487,7 +498,8 @@ static void parse_output_flags(const char *outputs)
         { "yaml", OUTPUT_YAML },
         { "default", OUTPUTS_DEFAULT },
         { "legacy-1", OUTPUTS_LEGACY_1 },
-        { "legacy-2", OUTPUTS_LEGACY_2 }
+        { "legacy-2", OUTPUTS_LEGACY_2 },
+        { "btrace", OUTPUT_TRACE_BIN },
     };
 
     output_flags = 0;
