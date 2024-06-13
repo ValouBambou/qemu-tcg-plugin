@@ -3488,7 +3488,7 @@ foreach target : target_dirs
 
   # Looks link plugins are target-specific as they need `tcg-plugin.h` which needs `cpu.h`
   if 'CONFIG_TCG_PLUGIN_CPP' in config_host
-    libcpp_plugin = shared_library('tcg-plugin-cpp',
+    libcpp_plugin = shared_library('tcg-plugin-cpp' + target_name,
       build_by_default: true,
       sources: tcg_cpp_plugin_src + genh,
       dependencies: [capstone, libelf, libdwarf],
@@ -3502,7 +3502,7 @@ foreach target : target_dirs
   endif
 
   if 'CONFIG_TCG_PLUGIN' in config_host
-    libdinero_plugin = shared_library('tcg-plugin-dineroIV',
+    libdinero_plugin = shared_library('tcg-plugin-dineroIV' + target_name,
       build_by_default: true,
       sources: dinero_plugin_src + genh,
       link_with: libdinero,
@@ -3513,7 +3513,7 @@ foreach target : target_dirs
       install_dir: tcg_plugin_install_dir / target_name / target_type
     )
 
-    libdyncount_plugin = shared_library('tcg-plugin-dyncount',
+    libdyncount_plugin = shared_library('tcg-plugin-dyncount' + target_name,
       build_by_default: true,
       sources: dyncount_plugin_src + genh,
       dependencies: capstone,
@@ -3524,7 +3524,7 @@ foreach target : target_dirs
       install_dir: tcg_plugin_install_dir / target_name / target_type
     )
 
-    libdyntrace_plugin = shared_library('tcg-plugin-dyntrace',
+    libdyntrace_plugin = shared_library('tcg-plugin-dyntrace' + target_name,
       build_by_default: true,
       sources: dyntrace_plugin_src + genh,
       dependencies: capstone,
@@ -3535,7 +3535,7 @@ foreach target : target_dirs
       install_dir: tcg_plugin_install_dir / target_name / target_type
     )
 
-    libcoverage_plugin = shared_library('tcg-plugin-coverage',
+    libcoverage_plugin = shared_library('tcg-plugin-coverage' + target_name,
       build_by_default: true,
       sources: coverage_plugin_src + genh,
       dependencies: capstone,
@@ -3551,7 +3551,7 @@ foreach target : target_dirs
         'tcg/plugins/' + pl + '.c'
       )
 
-      lib_plugin = shared_library('tcg-plugin-' + pl,
+      lib_plugin = shared_library('tcg-plugin-' + pl +  target_name,
         build_by_default: true,
         sources: tcg_plugin_src + genh,
         c_args: tcg_plugin_carg + c_args,
